@@ -338,6 +338,7 @@
       <div class="dbg-row"><span>센서이벤트</span><b id="dbgEvents">0</b></div>
       <div class="dbg-row"><span>권한</span><b id="dbgPerm">—</b></div>
       <div class="dbg-row"><span>raw β</span><b id="dbgBeta">—</b></div>
+      <div class="dbg-row"><span>음원로드</span><b id="dbgTracks">—</b></div>
     </div>
     <div class="g-badge" id="gBadge">VOL +</div>
     <div class="scene">
@@ -387,17 +388,6 @@
 </div>
 
 <script>
-// 트랙 메타데이터 — mp3 파일은 같은 폴더의 tracks/ 에서 로드
-var TRACK_DATA = [
-  {title:"Its Me", artist:"ILLIT (아일릿)", src:"tracks/track1.mp3"},
-  {title:"캐치 캐치 (Kaeci Kaeci)", artist:"최예나 (YENA)", src:"tracks/track2.mp3"},
-  {title:"Good Goodbye", artist:"화사 (Hwasa)", src:"tracks/track3.mp3"},
-  {title:"소문의 낙원 (Paradise of Rumors)", artist:"악뮤 (AKMU)", src:"tracks/track4.mp3"},
-  {title:"비행기 (Airplane)", artist:"한해, 문세윤 (feat. CYU)", src:"tracks/track5.mp3"},
-  {title:"사랑하게 될 거야 (Landing in Love)", artist:"한로로 (Hanroro)", src:"tracks/track6.mp3"}
-];
-</script>
-<script>
 (function(){
   "use strict";
   var $ = function(id){ return document.getElementById(id); };
@@ -419,11 +409,20 @@ var TRACK_DATA = [
   };
 
   /* ============================================================
-     트랙 정의
-     - 실제 mp3 6곡이 이 HTML 안에 base64로 임베드되어 있습니다.
-       (TRACK_DATA 는 문서 상단의 데이터 스크립트에서 정의)
+     트랙 정의 — 외부 mp3 파일을 경로로 불러옵니다.
   ============================================================ */
-  var TRACKS = TRACK_DATA;   // [{title, artist, src}, ...]
+  // ── 음원 경로 설정 ──────────────────────────────
+  // 음원이 index.html 과 같은 위치(루트)에 track1~6.mp3 로 있음.
+  // 폴더에 두었다면 "Tracks/" 처럼 폴더명/ 을 넣으면 됩니다.
+  var TRACK_BASE = "";
+  var TRACKS = [
+    { title: "Its Me",                         artist: "ILLIT (아일릿)",          file: "track1.mp3" },
+    { title: "캐치 캐치 (Kaeci Kaeci)",          artist: "최예나 (YENA)",           file: "track2.mp3" },
+    { title: "Good Goodbye",                   artist: "화사 (Hwasa)",            file: "track3.mp3" },
+    { title: "소문의 낙원 (Paradise of Rumors)", artist: "악뮤 (AKMU)",             file: "track4.mp3" },
+    { title: "비행기 (Airplane)",                artist: "한해, 문세윤 (feat. CYU)", file: "track5.mp3" },
+    { title: "사랑하게 될 거야 (Landing in Love)", artist: "한로로 (Hanroro)",        file: "track6.mp3" }
+  ];
 
   /* ============================================================
      로그
@@ -456,22 +455,48 @@ var TRACK_DATA = [
 
     // 트랙별 audio 엘리먼트 + WebAudio 소스노드 생성
     TRACKS.forEach(function(t, i){
+      var url = TRACK_BASE + t.file;
       var a = new Audio();
-      a.src = t.src;
       a.loop = true;          // 곡 자체 루프
       a.preload = "auto";
-      a.crossOrigin = "anonymous";
+      // 같은 도메인(GitHub Pages)이면 crossOrigin 불필요 — 생략해야 안전
+
+      // 로딩 성공/실패를 진단 패널과 로그에 반영
+      a.addEventListener('canplaythrough', function(){
+        t._loaded = true;
+        log('TRACK ' + (i+1) + ' 로드 OK — ' + t.file);
+      });
+      a.addEventListener('error', function(){
+        t._error = true;
+        var code = a.error ? a.error.code : '?';
+        log('⚠ TRACK ' + (i+1) + ' 로드 실패 (' + url + ') code=' + code);
+      });
+
+      a.src = url;
       try {
         var node = audioCtx.createMediaElementSource(a);
         node.connect(masterGain);
         t._routed = true;
       } catch(e){
-        // 라우팅 실패 시 엘리먼트 볼륨으로 폴백
-        t._routed = false;
+        t._routed = false;   // 라우팅 실패 시 엘리먼트 볼륨으로 폴백
       }
+      a.load();
       players.push(a);
     });
-    log('오디오 엔진 준비 — ' + TRACKS.length + '곡 임베드');
+    log('오디오 엔진 준비 — ' + TRACKS.length + '곡 (' + TRACK_BASE + ')');
+
+    // 3초 후에도 한 곡도 안 잡히면 경로 문제 안내
+    setTimeout(function(){
+      var ok = TRACKS.filter(function(t){ return t._loaded; }).length;
+      var err = TRACKS.filter(function(t){ return t._error; }).length;
+      if(ok === 0){
+        log('⚠ 음원 0곡 로드됨 — 경로 확인 필요. 현재 BASE="' + TRACK_BASE + '"');
+        log('   → GitHub의 실제 파일 위치/이름과 일치하는지 확인하세요');
+      } else {
+        log('음원 ' + ok + '/' + TRACKS.length + '곡 로드 완료'
+            + (err ? ' (' + err + '곡 실패)' : ''));
+      }
+    }, 3000);
   }
 
   /* ============================================================
@@ -936,6 +961,16 @@ var TRACK_DATA = [
     setDbg('dbgBeta',
       (typeof S.lastBeta === 'number') ? S.lastBeta.toFixed(1) + '°' : '—',
       (typeof S.lastBeta === 'number') ? 'ok' : '');
+    if(TRACKS && TRACKS.length){
+      var ok = 0, err = 0;
+      for(var i=0;i<TRACKS.length;i++){
+        if(TRACKS[i]._loaded) ok++;
+        if(TRACKS[i]._error) err++;
+      }
+      var txt = ok + '/' + TRACKS.length + (err ? ' (✗' + err + ')' : '');
+      setDbg('dbgTracks', txt,
+        ok === 0 ? 'bad' : (ok === TRACKS.length ? 'ok' : ''));
+    }
   }, 300);
 
   // 진행바 업데이트
