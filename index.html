@@ -338,6 +338,7 @@
       <div class="dbg-row"><span>센서이벤트</span><b id="dbgEvents">0</b></div>
       <div class="dbg-row"><span>권한</span><b id="dbgPerm">—</b></div>
       <div class="dbg-row"><span>raw β</span><b id="dbgBeta">—</b></div>
+      <div class="dbg-row"><span>pitch/yaw</span><b id="dbgAxis">—</b></div>
       <div class="dbg-row"><span>음원로드</span><b id="dbgTracks">—</b></div>
     </div>
     <div class="g-badge" id="gBadge">VOL +</div>
@@ -401,9 +402,9 @@
     playing: false,
     trackIdx: 0,
     volume: 0.70,        // 0~1
-    pitch: 0, yaw: 0,    // 평활화된 각도
+    pitchRaw: 0, yawRaw: 0,   // 센서 원시값(가로 모드 축 보정 후)
+    pitch: 0, yaw: 0,         // 평활화된 각도
     pitchRef: null, yawRef: null,  // 모드 진입 시 기준점(상대 측정)
-    yawAbs: null, yawPrev: null,
     lastTrackChange: 0,
     sensorOk: false
   };
@@ -438,30 +439,27 @@
   }
 
   /* ============================================================
-     오디오 엔진 — 임베드된 mp3 재생
-     모든 트랙을 <audio> 엘리먼트로 미리 만들어 두고,
-     Web Audio masterGain 그래프로 묶어 볼륨을 통합 제어합니다.
+     오디오 엔진 — mp3 재생
+     각 트랙을 <audio> 엘리먼트로 만들고, 볼륨은 엘리먼트의
+     .volume 속성으로 직접 제어한다. (Web Audio 그래프 미사용 —
+     createMediaElementSource 는 일부 브라우저에서 음소거 버그가 있어 제외)
   ============================================================ */
-  var audioCtx, masterGain;
+  var audioCtx;            // 버즈 무음오디오/제스처용으로만 사용
   var players = [];        // 트랙별 <audio> 엘리먼트
   var htmlAudio = null;    // 현재 재생 중인 엘리먼트
 
   function initAudio(){
     var AC = window.AudioContext || window.webkitAudioContext;
-    audioCtx = new AC();
-    masterGain = audioCtx.createGain();
-    masterGain.gain.value = S.volume;
-    masterGain.connect(audioCtx.destination);
+    try { audioCtx = new AC(); } catch(e){ audioCtx = null; }
 
-    // 트랙별 audio 엘리먼트 + WebAudio 소스노드 생성
+    // 트랙별 audio 엘리먼트 생성
     TRACKS.forEach(function(t, i){
       var url = TRACK_BASE + t.file;
       var a = new Audio();
       a.loop = true;          // 곡 자체 루프
       a.preload = "auto";
-      // 같은 도메인(GitHub Pages)이면 crossOrigin 불필요 — 생략해야 안전
+      a.volume = S.volume;    // 초기 볼륨
 
-      // 로딩 성공/실패를 진단 패널과 로그에 반영
       a.addEventListener('canplaythrough', function(){
         t._loaded = true;
         log('TRACK ' + (i+1) + ' 로드 OK — ' + t.file);
@@ -473,13 +471,6 @@
       });
 
       a.src = url;
-      try {
-        var node = audioCtx.createMediaElementSource(a);
-        node.connect(masterGain);
-        t._routed = true;
-      } catch(e){
-        t._routed = false;   // 라우팅 실패 시 엘리먼트 볼륨으로 폴백
-      }
       a.load();
       players.push(a);
     });
@@ -488,13 +479,8 @@
     // 3초 후에도 한 곡도 안 잡히면 경로 문제 안내
     setTimeout(function(){
       var ok = TRACKS.filter(function(t){ return t._loaded; }).length;
-      var err = TRACKS.filter(function(t){ return t._error; }).length;
       if(ok === 0){
         log('⚠ 음원 0곡 로드됨 — 경로 확인 필요. 현재 BASE="' + TRACK_BASE + '"');
-        log('   → GitHub의 실제 파일 위치/이름과 일치하는지 확인하세요');
-      } else {
-        log('음원 ' + ok + '/' + TRACKS.length + '곡 로드 완료'
-            + (err ? ' (' + err + '곡 실패)' : ''));
       }
     }, 3000);
   }
@@ -566,30 +552,66 @@
   }
   function togglePlay(){ S.playing ? pauseTrack() : playTrack(); }
 
+  /* ============================================================
+     음성 안내 — Web Speech API (SpeechSynthesis)
+  ============================================================ */
+  function speak(text){
+    try {
+      if(!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();          // 이전 멘트 끊고 새로
+      var u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ko-KR';
+      u.rate = 1.05;
+      u.pitch = 1.0;
+      window.speechSynthesis.speak(u);
+    } catch(e){}
+  }
+
+  // 안내 멘트가 끝나고 나서 곡을 바꾸기 위한 지연 헬퍼.
+  // 멘트 길이에 맞춰 delay 를 정하고, 그 뒤 실제 곡 전환.
+  function announceThen(text, delay, action){
+    speak(text);
+    log('🔊 ' + text);
+    setTimeout(action, delay);
+  }
+
   function nextTrack(){
-    log('▶ 다음 곡');
+    var last = TRACKS.length - 1;
     flashBadge('NEXT ▶', 'var(--blue)');
-    loadTrack(S.trackIdx + 1, S.playing);
+    if(S.trackIdx === last){
+      // 마지막 곡 → 처음 곡으로 순환
+      announceThen('마지막 곡이라서 처음 곡으로 이동합니다', 2400, function(){
+        loadTrack(0, S.playing);
+      });
+    } else {
+      announceThen('다음 곡으로 이동합니다', 1500, function(){
+        loadTrack(S.trackIdx + 1, S.playing);
+      });
+    }
   }
   function prevTrack(){
-    log('◀ 이전 곡');
+    var last = TRACKS.length - 1;
     flashBadge('◀ PREV', 'var(--blue)');
-    loadTrack(S.trackIdx - 1, S.playing);
+    if(S.trackIdx === 0){
+      // 처음 곡 → 마지막 곡으로 순환
+      announceThen('처음 곡이라서 마지막 곡으로 이동합니다', 2400, function(){
+        loadTrack(last, S.playing);
+      });
+    } else {
+      announceThen('이전 곡으로 이동합니다', 1500, function(){
+        loadTrack(S.trackIdx - 1, S.playing);
+      });
+    }
   }
 
   /* ============================================================
-     볼륨
+     볼륨 — 모든 <audio> 엘리먼트의 .volume 을 직접 설정
   ============================================================ */
   function applyVolume(){
     S.volume = Math.max(0, Math.min(1, S.volume));
-    if(masterGain){
-      masterGain.gain.setTargetAtTime(S.volume, audioCtx.currentTime, 0.08);
-    }
-    // WebAudio 그래프에 라우팅된 트랙은 masterGain이 음량을 잡으므로
-    // 엘리먼트 볼륨은 1로 둔다. 라우팅 실패한 트랙만 엘리먼트 볼륨으로 제어.
-    var cur = TRACKS[S.trackIdx];
-    if(htmlAudio){
-      htmlAudio.volume = (cur && cur._routed) ? 1 : S.volume;
+    // 현재 곡뿐 아니라 전체 트랙에 적용 — 곡이 바뀌어도 볼륨 유지
+    for(var i=0;i<players.length;i++){
+      players[i].volume = S.volume;
     }
     var pct = Math.round(S.volume * 100);
     $('volPct').textContent = pct;
@@ -607,10 +629,10 @@
     if(S.armed) return;
     S.armed = true;
     S.armSource = source;
-    // 진입 순간의 자세를 기준점으로 — 상대 측정
-    S.pitchRef = S.pitchRaw;
-    S.yawRef = S.yawAbs;
-    S.yawPrev = S.yawAbs;
+    // 진입 순간의 자세를 기준점으로 — 평활화된 현재값을 캡처해 상대 측정
+    S.pitchRef = S.pitch;
+    S.yawRef   = S.yaw;
+    S.lastTrackChange = performance.now();   // 진입 직후 곡 넘김 오발동 방지
     $('led').classList.add('on');
     $('modeTxt').textContent = '제스처 ON · ' + (source === 'buds' ? '버즈' : 'HOLD');
     $('face').classList.add('armed');
@@ -655,87 +677,113 @@
   ============================================================ */
   S.pitchRaw = 0;
 
+  /* ----------------------------------------------------------
+     센서 입력 — 가로(landscape) 모드 기준
+     폰을 가로로 들었을 때:
+       · 고개 상하(끄덕임) → beta 축 변화
+       · 고개 좌우(회전)   → gamma 축 변화
+     나침반(alpha/compass)은 자기장 간섭이 심해 사용하지 않고,
+     gamma 기울기를 좌우 회전 신호로 직접 쓴다.
+  ---------------------------------------------------------- */
   function onOrientation(e){
     S.sensorOk = true;
     S.eventCount = (S.eventCount || 0) + 1;
     S.lastBeta = e.beta;
-    // ----- PITCH (상하) -----
-    if(typeof e.beta === 'number'){
-      // beta: 폰을 세웠을 때 ~90. 가로로 들면 기준이 다름.
-      // 가로 모드에서 머리 끄덕임은 beta 변화로 잡음.
-      S.pitchRaw = e.beta;
+    S.lastGamma = e.gamma;
+
+    // 화면 방향(가로/세로)에 따라 축 보정
+    var ori = (screen.orientation && screen.orientation.angle);
+    if(typeof ori !== 'number') ori = window.orientation || 0;
+
+    var beta  = (typeof e.beta  === 'number') ? e.beta  : 0;
+    var gamma = (typeof e.gamma === 'number') ? e.gamma : 0;
+
+    // 가로 모드: 회전 각도에 따라 상하/좌우 축이 뒤바뀜
+    var pitch, yaw;
+    if(ori === 90){
+      // 가로(왼쪽으로 눕힘): 상하=gamma, 좌우=beta
+      pitch = gamma;
+      yaw   = beta;
+    } else if(ori === -90 || ori === 270){
+      // 가로(오른쪽으로 눕힘): 부호 반대
+      pitch = -gamma;
+      yaw   = -beta;
+    } else {
+      // 세로(폴백): 상하=beta, 좌우=gamma
+      pitch = beta;
+      yaw   = gamma;
     }
-    // ----- YAW (좌우) -----
-    var h = null;
-    if(typeof e.webkitCompassHeading === 'number') h = e.webkitCompassHeading;
-    else if(typeof e.alpha === 'number') h = 360 - e.alpha;
-    if(h !== null){
-      if(S.yawAbs === null) S.yawAbs = h;
-      else {
-        var diff = h - S.yawAbs;
-        while(diff > 180) diff -= 360;
-        while(diff < -180) diff += 360;
-        S.yawAbs = (S.yawAbs + diff * 0.25 + 360) % 360;
-      }
-    }
+
+    // 평활화된 원시값 — gestureLoop 에서 기준점 대비 상대 측정
+    S.pitchRaw = pitch;
+    S.yawRaw   = yaw;
   }
 
   /* ============================================================
      제스처 처리 루프 (80ms)
   ============================================================ */
-  var VOL_RATE = 0.020;     // 프레임당 볼륨 변화량
-  var PITCH_DEAD = 8;       // 데드존(도)
-  var YAW_TURN = 38;        // 곡 넘김 임계각(도)
+  var VOL_RATE   = 0.022;   // 프레임당 볼륨 변화량
+  var PITCH_DEAD = 7;       // 상하 데드존(도)
+  var YAW_TURN   = 32;      // 곡 넘김 임계각(도)
+  var AXIS_BIAS  = 1.3;     // 우세 축 판정 — 한 축이 다른 축의 1.3배 이상일 때만 인정
+  var SMOOTH     = 0.35;    // 센서 평활화 계수(0~1, 클수록 민감)
 
   function gestureLoop(){
-    // 화면 표시용 평활화
-    S.pitch = S.pitch * 0.7 + S.pitchRaw * 0.3;
+    // ---- 원시 센서값 평활화 (떨림 제거) ----
+    S.pitch = S.pitch * (1 - SMOOTH) + (S.pitchRaw || 0) * SMOOTH;
+    S.yaw   = S.yaw   * (1 - SMOOTH) + (S.yawRaw   || 0) * SMOOTH;
 
+    // ---- 기준점 대비 상대 각도 ----
     var pitchRel = 0, yawRel = 0;
-    if(S.armed && S.pitchRef !== null){
-      pitchRel = S.pitchRaw - S.pitchRef;
-    }
-    if(S.armed && S.yawRef !== null && S.yawAbs !== null){
-      yawRel = S.yawAbs - S.yawRef;
-      while(yawRel > 180) yawRel -= 360;
-      while(yawRel < -180) yawRel += 360;
-    }
+    if(S.armed && S.pitchRef !== null) pitchRel = S.pitch - S.pitchRef;
+    if(S.armed && S.yawRef   !== null) yawRel   = S.yaw   - S.yawRef;
 
     // ---- 3D 머리 반영 ----
-    var showPitch = S.armed ? pitchRel : (S.pitchRaw - 45);
-    var showYaw = S.armed ? yawRel : 0;
+    var showPitch = S.armed ? pitchRel : 0;
+    var showYaw   = S.armed ? yawRel   : 0;
     $('head').style.transform =
       'rotateX(' + (-showPitch * 0.9) + 'deg) rotateY(' + (showYaw * 0.9) + 'deg)';
     $('vPitch').textContent = Math.round(showPitch) + '°';
-    $('vYaw').textContent = Math.round(showYaw) + '°';
+    $('vYaw').textContent   = Math.round(showYaw) + '°';
     $('vPitch').classList.toggle('hot', S.armed);
     $('vYaw').classList.toggle('hot', S.armed);
 
     if(!S.armed) return;
 
-    // ---- 볼륨: 고개 상하 ----
-    // pitchRel 양수 = 고개 숙임(아래) / 음수 = 고개 듦(위)  ← 기기에 따라 부호 보정
-    if(Math.abs(pitchRel) > PITCH_DEAD){
-      var dir = pitchRel < 0 ? +1 : -1;   // 위로 들면 +, 아래로 숙이면 -
-      var strength = Math.min(1, (Math.abs(pitchRel) - PITCH_DEAD) / 35);
-      nudgeVolume(dir * VOL_RATE * (0.3 + strength));
+    // ---- 우세 축 판정 ----
+    // 두 축이 동시에 움직여도, 더 크게 움직인 축 하나만 인정.
+    // 이렇게 해야 "고개 들기"가 곡 넘김으로 오인되는 충돌을 막는다.
+    var absP = Math.abs(pitchRel), absY = Math.abs(yawRel);
+    var axis = 'none';
+    if(absP > absY * AXIS_BIAS && absP > PITCH_DEAD) axis = 'pitch';
+    else if(absY > absP * AXIS_BIAS && absY > YAW_TURN) axis = 'yaw';
+
+    // ---- 볼륨: 고개 상하 (pitch 축) ----
+    if(axis === 'pitch'){
+      // pitchRel 음수 = 고개 듦(위) → 볼륨 업 / 양수 = 숙임(아래) → 다운
+      // 기기에서 반대로 동작하면 아래 VOL_SIGN 만 -1 로.
+      var VOL_SIGN = +1;
+      var dir = (pitchRel < 0 ? +1 : -1) * VOL_SIGN;
+      var strength = Math.min(1, (absP - PITCH_DEAD) / 32);
+      nudgeVolume(dir * VOL_RATE * (0.35 + strength));
       if(dir > 0) flashBadge('VOL ▲ ' + Math.round(S.volume*100), 'var(--vol)');
-      else flashBadge('VOL ▼ ' + Math.round(S.volume*100), 'var(--hot)');
+      else        flashBadge('VOL ▼ ' + Math.round(S.volume*100), 'var(--hot)');
     }
 
-    // ---- 곡 넘김: 고개 좌우 ----
+    // ---- 곡 넘김: 고개 좌우 (yaw 축) ----
+    // 곡 전환은 안내 멘트 + 지연이 있으므로 쿨다운을 넉넉히.
     var now = performance.now();
-    if(now - S.lastTrackChange > 900){
+    if(axis === 'yaw' && now - S.lastTrackChange > 3000){
+      S.lastTrackChange = now;
       if(yawRel > YAW_TURN){
-        S.lastTrackChange = now;
-        S.yawRef = S.yawAbs;            // 기준 리셋(연속 넘김 방지)
+        flashBud();
         nextTrack();
-        flashBud();
+        // 기준점을 현재 자세로 리셋 → 머리를 원위치 안 해도 연속 오발동 방지
+        S.yawRef = S.yaw;
       } else if(yawRel < -YAW_TURN){
-        S.lastTrackChange = now;
-        S.yawRef = S.yawAbs;
-        prevTrack();
         flashBud();
+        prevTrack();
+        S.yawRef = S.yaw;
       }
     }
   }
@@ -767,8 +815,9 @@
      - 버즈 더블/트리플 탭 → next/prev → 직접 곡 넘김
   ============================================================ */
   var silentAudio = null;
+  var lastBudsTap = 0;
   function armMediaSession(){
-    // 무음 루프 오디오
+    // 무음 루프 오디오 — 페이지를 미디어 타깃으로 만들어 버즈 신호를 받음
     try {
       silentAudio = new Audio();
       silentAudio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
@@ -779,28 +828,39 @@
 
     if('mediaSession' in navigator){
       try {
-        // 버즈 한 번 탭 = play/pause. 이걸 제스처 모드 토글로 사용.
-        navigator.mediaSession.setActionHandler('play', function(){
-          log('BUDS 탭 → play 신호');
+        // 버즈 한 번 탭(play 또는 pause 신호) = 제스처 모드 토글.
+        // OS가 신호를 중복 발사하거나 음악 재생/정지와 충돌하면
+        // 모드가 켜지자마자 꺼지므로, 600ms 디바운스로 1회만 인정.
+        function onBudsTap(kind){
+          var now = performance.now();
+          if(now - lastBudsTap < 600){
+            return;   // 디바운스 — 연타·중복신호 무시
+          }
+          lastBudsTap = now;
           flashBud();
-          if(!S.armed) armGestures('buds');
-          else if(S.armSource === 'buds') disarmGestures();
-        });
-        navigator.mediaSession.setActionHandler('pause', function(){
-          log('BUDS 탭 → pause 신호');
-          flashBud();
-          if(!S.armed) armGestures('buds');
-          else if(S.armSource === 'buds') disarmGestures();
-        });
-        // 버즈 더블 탭 = 다음 곡
+          if(!S.armed){
+            armGestures('buds');
+          } else if(S.armSource === 'buds'){
+            disarmGestures();
+          } else {
+            // HOLD로 켜진 상태면 버즈 탭은 무시(혼선 방지)
+          }
+          log('BUDS 탭(' + kind + ') → 제스처 ' + (S.armed ? 'ON' : 'OFF'));
+        }
+        navigator.mediaSession.setActionHandler('play',  function(){ onBudsTap('play'); });
+        navigator.mediaSession.setActionHandler('pause', function(){ onBudsTap('pause'); });
+        // 버즈 더블 탭 = 다음 곡 / 트리플 탭 = 이전 곡
         navigator.mediaSession.setActionHandler('nexttrack', function(){
-          log('BUDS 더블탭 → next');
-          flashBud(); nextTrack();
+          var now = performance.now();
+          if(now - lastBudsTap < 600) return;
+          lastBudsTap = now;
+          log('BUDS 더블탭 → 다음 곡'); flashBud(); nextTrack();
         });
-        // 버즈 트리플 탭 = 이전 곡
         navigator.mediaSession.setActionHandler('previoustrack', function(){
-          log('BUDS 트리플탭 → prev');
-          flashBud(); prevTrack();
+          var now = performance.now();
+          if(now - lastBudsTap < 600) return;
+          lastBudsTap = now;
+          log('BUDS 트리플탭 → 이전 곡'); flashBud(); prevTrack();
         });
         log('MEDIA SESSION 준비 — 버즈 탭 감지 활성');
       } catch(e){
@@ -828,12 +888,13 @@
 
   /* ============================================================
      데스크톱 폴백 — 키보드로 머리 움직임 테스트
+     ↑↓ = 고개 상하(볼륨), ←→ = 고개 좌우(곡 넘김), Space = 모드 토글
   ============================================================ */
   document.addEventListener('keydown', function(e){
-    if(e.key === 'ArrowUp'){ S.pitchRaw -= 4; }
-    if(e.key === 'ArrowDown'){ S.pitchRaw += 4; }
-    if(e.key === 'ArrowLeft'){ S.yawAbs = ((S.yawAbs||0) - 6 + 360) % 360; }
-    if(e.key === 'ArrowRight'){ S.yawAbs = ((S.yawAbs||0) + 6 + 360) % 360; }
+    if(e.key === 'ArrowUp'){ S.pitchRaw -= 5; }
+    if(e.key === 'ArrowDown'){ S.pitchRaw += 5; }
+    if(e.key === 'ArrowLeft'){ S.yawRaw -= 6; }
+    if(e.key === 'ArrowRight'){ S.yawRaw += 6; }
     if(e.key === ' '){ e.preventDefault();
       if(S.armed && S.armSource==='hold') disarmGestures(); else armGestures('hold'); }
   });
@@ -854,9 +915,9 @@
       if(!dragging) return;
       var dx = x - lastX, dy = y - lastY;
       lastX = x; lastY = y;
-      S.pitchRaw += dy * 0.5;                          // 위로 끌면 고개 듦
-      S.yawAbs = ((S.yawAbs || 0) + dx * 0.6 + 360) % 360;
-      S.sensorOk = true;                               // 폴백도 동작으로 간주
+      S.pitchRaw += dy * 0.5;        // 위로 끌면 고개 듦
+      S.yawRaw   += dx * 0.6;        // 좌우로 끌면 고개 회전
+      S.sensorOk = true;            // 폴백도 동작으로 간주
     }
     function end(){ dragging = false; }
     leftArea.addEventListener('touchstart', function(e){
@@ -941,7 +1002,7 @@
   ============================================================ */
   $('enterBtn').addEventListener('click', function(){
     initAudio();
-    audioCtx.resume();
+    if(audioCtx && audioCtx.resume) audioCtx.resume();
     requestSensors();
     armMediaSession();
     buildTrackList();
@@ -959,8 +1020,11 @@
     var ec = S.eventCount || 0;
     setDbg('dbgEvents', String(ec), ec > 0 ? 'ok' : 'bad');
     setDbg('dbgBeta',
-      (typeof S.lastBeta === 'number') ? S.lastBeta.toFixed(1) + '°' : '—',
+      (typeof S.lastBeta === 'number') ? S.lastBeta.toFixed(0) + '°' : '—',
       (typeof S.lastBeta === 'number') ? 'ok' : '');
+    setDbg('dbgAxis',
+      Math.round(S.pitch) + ' / ' + Math.round(S.yaw),
+      S.armed ? 'ok' : '');
     if(TRACKS && TRACKS.length){
       var ok = 0, err = 0;
       for(var i=0;i<TRACKS.length;i++){
