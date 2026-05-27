@@ -337,9 +337,9 @@
       <div class="dbg-row"><span>보안컨텍스트</span><b id="dbgSecure">—</b></div>
       <div class="dbg-row"><span>센서이벤트</span><b id="dbgEvents">0</b></div>
       <div class="dbg-row"><span>권한</span><b id="dbgPerm">—</b></div>
-      <div class="dbg-row"><span>기울기 β</span><b id="dbgBeta">—</b></div>
+      <div class="dbg-row"><span>절대각 P/Y</span><b id="dbgBeta">—</b></div>
       <div class="dbg-row"><span>볼륨각/회전각</span><b id="dbgAxis">—</b></div>
-      <div class="dbg-row"><span>자이로 상하/좌우</span><b id="dbgGyro">—</b></div>
+      <div class="dbg-row"><span>곡넘김 상태</span><b id="dbgGyro">—</b></div>
       <div class="dbg-row"><span>음원로드</span><b id="dbgTracks">—</b></div>
     </div>
     <div class="g-badge" id="gBadge">VOL +</div>
@@ -403,8 +403,6 @@
     playing: false,
     trackIdx: 0,
     volume: 0.70,        // 0~1
-    pitchRate: 0, pitchAccum: 0,  // 상하 자이로 회전속도 / 누적각(볼륨)
-    yawRate: 0,   yawAccum: 0,    // 좌우 자이로 회전속도 / 누적각(곡 넘김)
     lastTrackChange: 0,
     sensorOk: false
   };
@@ -629,23 +627,32 @@
     if(S.armed) return;
     S.armed = true;
     S.armSource = source;
-    // 모드 진입 순간을 정면(0°)으로 — 두 누적각을 0으로 리셋.
-    // 진입 시점의 고개 자세가 곧 "정면", 볼륨은 그 순간 50% 기준.
-    S.pitchAccum = 0;
-    S.yawAccum   = 0;
-    S.lastTrackChange = performance.now();   // 진입 직후 곡 넘김 오발동 방지
+
+    // ── 활성화 순간을 '중심(0°)'으로 캡처 ──
+    // 센서값이 이미 들어와 있으면 지금 자세를 중심으로,
+    // 아직이면 null 로 두고 gestureLoop 첫 프레임이 채운다.
+    S.centerYaw   = (S.rawYaw   !== null) ? S.rawYaw   : null;
+    S.centerPitch = (S.rawPitch !== null) ? S.rawPitch : null;
+    S.centerVol   = S.volume;                // 볼륨 중심 = 현재 볼륨
+    S.relYaw = 0; S.relPitch = 0;
+    S.turnArmed = true;                      // 곡 넘김 무장
+    S.lastTrackChange = performance.now();   // 진입 직후 오발동 방지
+
     $('led').classList.add('on');
     $('modeTxt').textContent = '제스처 ON · ' + (source === 'buds' ? '버즈' : 'HOLD');
     $('face').classList.add('armed');
     $('head').classList.add('armed');
     $('volBar').classList.add('armed');
-    log('GESTURE <b>ON</b> (' + source + ') — 정면 기준 리셋');
+    log('GESTURE <b>ON</b> (' + source + ') — 현재 자세를 중심으로 캡처');
   }
   function disarmGestures(){
     if(!S.armed) return;
     S.armed = false;
     var src = S.armSource;
     S.armSource = null;
+    // 중심값 해제 — 다음 활성화 때 새로 캡처
+    S.centerYaw = null; S.centerPitch = null;
+    S.relYaw = 0; S.relPitch = 0;
     $('led').classList.remove('on');
     $('modeTxt').textContent = '제스처 OFF';
     $('face').classList.remove('armed');
@@ -672,152 +679,169 @@
   }
 
   /* ============================================================
-     센서 입력 — 이마 부착(head-mount) 자세 전용 / 완전 자이로 기반
-     ───────────────────────────────────────────────────────────
-     사용 자세: 업로드 이미지(세로 폰)를 반시계 90° 회전한 상태.
-       = 카메라(노치)가 왼쪽, 화면이 사용자(얼굴) 쪽, 폰 긴 변이 수평.
+     센서 입력 — 이마 부착 자세 / 절대각도(deviceorientation) 기반
+     ════════════════════════════════════════════════════════════
+     [설계 원칙]  자이로 적분을 쓰지 않는다.
+       이전 설계는 회전'속도'를 적분해 각도를 만들었으나, 적분은
+       드리프트(오차 누적)가 필연이고 게이트·감쇠 보정이 얽혀 꼬였다.
+       이번엔 deviceorientation 이 주는 '절대 각도'를 직접 쓴다.
+       · 활성화 순간의 각도를 중심(0°)으로 저장
+       · 매 순간  상대각 = 현재각 − 중심각
+       드리프트 없음. "고개 20° 돌림" = 숫자 그대로 20.
 
-     PITCH·YAW 를 모두 devicemotion 의 자이로(rotationRate)로 측정한다.
-     기울기 센서(beta/gamma)는 자세에 따라 축이 뒤섞여 불안정하지만,
-     자이로 회전속도는 "지금 어느 축으로 얼마나 빨리 도는가"를 직접 재므로
-     이마 부착처럼 폰이 머리와 한 몸으로 도는 상황에 가장 정확하다.
+     [기준 자세]  폰을 왼쪽으로 가로로 눕힘(노치 왼쪽), 화면이
+       사용자 쪽. 그대로 이마에 붙이고 활성화.
 
-     이 가로 자세에서 머리 회전 ↔ rotationRate 축 대응:
-       · 고개 들기/내리기(PITCH) → 폰 긴 변(좌우축) 중심 회전 = rotationRate.alpha
-       · 고개 좌우 돌리기(YAW)   → 중력방향(수직축) 중심 회전 = rotationRate.gamma
-     기기·브라우저별 편차가 있어, 아래 AXIS_* 상수로 어느 성분을
-     쓸지와 부호를 한 곳에서 보정할 수 있게 했다.
+     [축 대응]  이 가로 자세에서 deviceorientation 값:
+       · 고개 좌우 돌리기(YAW)   → gamma 가 변함  (−90~+90)
+       · 고개 위아래 들기(PITCH) → beta 가 변함
+       기기·브라우저 편차가 있어 AXIS_* / DIR 상수로 보정.
   ============================================================ */
-  // 자이로 축 매핑 — 실기 테스트로 확정. 'alpha'|'beta'|'gamma'
-  var AXIS_PITCH = 'alpha';   // 고개 상하에 대응하는 rotationRate 성분
-  var AXIS_YAW   = 'gamma';   // 고개 좌우에 대응하는 rotationRate 성분
-  // 방향 부호 — 기기에서 반대로 동작하면 +1 / -1 만 뒤집으면 됨.
-  // 이 부호를 회전속도 단계에서 적용하므로 화면 표시와 발동이 항상 일치.
-  var PITCH_DIR  = +1;        // 고개 들 때 볼륨 ↑ 가 되도록
-  var YAW_DIR    = -1;        // 오른쪽 회전 → 다음 곡 이 되도록 (좌우 반전 적용)
+  // 어떤 orientation 성분을 쓸지 — 'beta' | 'gamma' | 'alpha'
+  var AXIS_YAW    = 'gamma';  // 고개 좌우(곡 넘김)
+  var AXIS_PITCH  = 'beta';   // 고개 상하(볼륨)
+  // 방향 부호 — 동작이 반대면 +1 / -1 만 뒤집으면 됨
+  var YAW_DIR     = +1;       // 오른쪽으로 돌릴 때 상대각이 +가 되도록
+  var PITCH_DIR   = +1;       // 위로 들 때 상대각이 +가 되도록
 
-  S.pitchRate = 0;      // 상하 회전속도 (deg/s)
-  S.yawRate   = 0;      // 좌우 회전속도 (deg/s)
-  S.pitchAccum = 0;     // 상하 누적 회전각 (볼륨)
-  S.yawAccum   = 0;     // 좌우 누적 회전각 (곡 넘김)
+  // ── 동작 범위 ──
+  var YAW_TRIGGER = 20;       // 곡 넘김: 좌/우 20° 도달 시 발동
+  var VOL_RANGE   = 10;       // 볼륨: 중심에서 위/아래 각각 10° (총 20°)
+  var TURN_COOLDOWN = 1200;   // 곡 넘김 후 재발동 대기(ms)
 
-  // ---- deviceorientation : 진단 표시용으로만 사용 ----
+  // ── 센서 원시 절대각 (deviceorientation 가 채움) ──
+  S.rawYaw   = null;          // 현재 절대 yaw 각 (보정 후)
+  S.rawPitch = null;          // 현재 절대 pitch 각
+  // ── 활성화 시점 기준값 ──
+  S.centerYaw   = null;       // 활성화 순간 yaw — 곡넘김 중심(0°)
+  S.centerPitch = null;       // 활성화 순간 pitch — 볼륨 중심
+  S.centerVol   = 0.5;        // 활성화 순간 볼륨 — 볼륨 중심값
+  // ── 계산된 상대각 (gestureLoop 에서 갱신, 화면/판정 공용) ──
+  S.relYaw   = 0;
+  S.relPitch = 0;
+
+  // 각도 차이를 −180~+180 으로 정규화 (경계 넘김 처리)
+  function angleDiff(cur, ref){
+    var d = cur - ref;
+    while(d > 180)  d -= 360;
+    while(d < -180) d += 360;
+    return d;
+  }
+
+  // ---- deviceorientation : 절대 자세각 ----
   function onOrientation(e){
     S.sensorOk = true;
     S.eventCount = (S.eventCount || 0) + 1;
+
+    var v = { alpha: e.alpha, beta: e.beta, gamma: e.gamma };
+    var rawY = v[AXIS_YAW];
+    var rawP = v[AXIS_PITCH];
+    if(typeof rawY === 'number') S.rawYaw   = rawY * YAW_DIR;
+    if(typeof rawP === 'number') S.rawPitch = rawP * PITCH_DIR;
+
+    // 진단 패널용
     S.lastBeta  = e.beta;
     S.lastGamma = e.gamma;
+    S.lastAlpha = e.alpha;
   }
 
-  // ---- devicemotion : 자이로 회전속도 (PITCH·YAW 둘 다) ----
+  // ---- devicemotion : 진단용으로만 (자이로 회전속도 표시) ----
   function onMotion(e){
     S.sensorOk = true;
-    S.eventCount = (S.eventCount || 0) + 1;
     var rr = e.rotationRate;
-    if(!rr) return;
-
-    var a = (typeof rr.alpha === 'number') ? rr.alpha : 0;
-    var b = (typeof rr.beta  === 'number') ? rr.beta  : 0;
-    var g = (typeof rr.gamma === 'number') ? rr.gamma : 0;
-    var pick = { alpha: a, beta: b, gamma: g };
-
-    S.pitchRate = (pick[AXIS_PITCH] || 0) * PITCH_DIR;
-    S.yawRate   = (pick[AXIS_YAW]   || 0) * YAW_DIR;
-    // 진단 패널용
-    S.lastPitchRate = S.pitchRate;
-    S.lastYawRate   = S.yawRate;
-    S.lastRR = { a: a, b: b, g: g };
+    if(rr){
+      S.lastRR = {
+        a: (typeof rr.alpha === 'number') ? rr.alpha : 0,
+        b: (typeof rr.beta  === 'number') ? rr.beta  : 0,
+        g: (typeof rr.gamma === 'number') ? rr.gamma : 0
+      };
+    }
   }
 
   /* ============================================================
      제스처 처리 루프 (80ms)
-     PITCH·YAW 모두 자이로 회전속도를 적분해 누적 회전각으로 다룬다.
+     ────────────────────────────────────────────────────────────
+     절대각 기반 — 적분 없음. 매 프레임 상대각을 새로 계산한다.
+
+     [볼륨]  중심 = 활성화 시점 자세(centerPitch)·볼륨(centerVol).
+       relPitch =  0°  → 볼륨 = centerVol (그대로)
+       relPitch = +10° → 볼륨 = 100%      (위로 최대)
+       relPitch = −10° → 볼륨 = 0%        (아래로 최대)
+       즉 중심볼륨에서 위·아래로 자연스럽게 증감, 끝에서 100/0 도달.
+
+     [곡 넘김]  중심 = 활성화 시점 자세(centerYaw).
+       relYaw 가 +20° 도달 → 다음 곡 / −20° 도달 → 이전 곡.
+       한 번 발동하면 그 다음 발동까지 "중심 부근(±8°)으로
+       복귀"해야 재무장 — 고개를 되돌리지 않으면 연속 발동 안 됨.
   ============================================================ */
-  var LOOP_DT    = 0.08;    // 루프 주기(초) — 적분 간격
-
-  // ── 볼륨: 고개 상하(PITCH 누적 회전각) ──
-  // 모드 진입 자세를 0°(정면)로, 거기서 위/아래 각각 10°(총 20°) 범위에
-  // 볼륨 0~100% 를 그대로 매핑. 위 끝=100%, 정면=50%, 아래 끝=0%.
-  var VOL_RANGE   = 10;     // 정면 기준 한쪽 최대 각도(도) — ±10°
-  var PITCH_GATE  = 0.45;   // 상하 회전속도 게이트(deg/s) — 손떨림 차단
-  var PITCH_DECAY = 1.00;   // 상하 누적각 감쇠(1.0=감쇠없음 — 볼륨은 각도 유지가 자연스러움)
-
-  // ── 곡 넘김: 고개 좌우 회전(YAW 누적 회전각) ──
-  // 정면 기준 좌 20° ~ 우 20°, 총 40° 범위. 한쪽 20° 도달 시 곡 넘김 발동.
-  var YAW_TRIGGER = 20;     // 누적 회전각 임계(도) — 한쪽으로 이만큼 돌리면 발동
-  var YAW_CLAMP   = 20;     // 누적각 한계(±20°) — 이 범위를 넘겨 쌓이지 않게 클램프
-  var YAW_GATE    = 0.55;   // 회전속도 게이트(deg/s) — 이보다 느리면 적분 안 함(드리프트 차단)
-  var YAW_DECAY   = 0.90;   // 누적각 자연 감쇠 — 천천히 0으로 복귀(미세동작 리셋)
-
   function gestureLoop(){
-    // ===== 자이로 회전속도 적분 — PITCH·YAW 동일 구조 =====
-    // 게이트보다 빠른 회전만 누적 → 손떨림·드리프트 무시.
-
-    // ---- PITCH (볼륨) ----
-    var pRate = S.pitchRate || 0;
-    if(Math.abs(pRate) > PITCH_GATE){
-      S.pitchAccum += pRate * LOOP_DT;
-    } else {
-      S.pitchAccum *= PITCH_DECAY;
+    // ===== 센서 미동작 / 비활성 상태 =====
+    if(!S.armed){
+      // 머리 모형 정면 복귀
+      $('head').style.transform = 'rotateX(0deg) rotateY(0deg)';
+      $('vPitch').textContent = '0°';
+      $('vYaw').textContent   = '0°';
+      $('vPitch').classList.remove('hot');
+      $('vYaw').classList.remove('hot');
+      return;
     }
-    // 볼륨 각도는 ±VOL_RANGE 로 클램프(범위 밖으로 쌓이지 않게)
-    if(S.pitchAccum >  VOL_RANGE) S.pitchAccum =  VOL_RANGE;
-    if(S.pitchAccum < -VOL_RANGE) S.pitchAccum = -VOL_RANGE;
 
-    // ---- YAW (곡 넘김) ----
-    var yRate = S.yawRate || 0;
-    if(Math.abs(yRate) > YAW_GATE){
-      S.yawAccum += yRate * LOOP_DT;
-    } else {
-      S.yawAccum *= YAW_DECAY;
-    }
-    if(S.yawAccum >  YAW_CLAMP) S.yawAccum =  YAW_CLAMP;
-    if(S.yawAccum < -YAW_CLAMP) S.yawAccum = -YAW_CLAMP;
+    // ===== 활성화 중 — 상대각 계산 =====
+    // 활성화 직후 첫 프레임: 중심이 아직 없으면 지금 자세로 캡처
+    if(S.centerYaw === null && S.rawYaw !== null)   S.centerYaw   = S.rawYaw;
+    if(S.centerPitch === null && S.rawPitch !== null) S.centerPitch = S.rawPitch;
 
-    // ---- 3D 머리 반영 ----
-    var showPitch = S.armed ? S.pitchAccum : 0;
-    var showYaw   = S.armed ? S.yawAccum   : 0;
-    $('head').style.transform =
-      'rotateX(' + (-showPitch * 2.2) + 'deg) rotateY(' + (showYaw * 2.2) + 'deg)';
-    $('vPitch').textContent = Math.round(showPitch) + '°';
-    $('vYaw').textContent   = Math.round(showYaw) + '°';
-    $('vPitch').classList.toggle('hot', S.armed);
-    $('vYaw').classList.toggle('hot', S.armed);
+    // 상대각 = 현재 절대각 − 중심각
+    S.relYaw   = (S.rawYaw   !== null && S.centerYaw   !== null)
+                 ? angleDiff(S.rawYaw, S.centerYaw)     : 0;
+    S.relPitch = (S.rawPitch !== null && S.centerPitch !== null)
+                 ? angleDiff(S.rawPitch, S.centerPitch) : 0;
 
-    if(!S.armed){ S.pitchAccum = 0; S.yawAccum = 0; return; }
-
-    // ---- 볼륨: PITCH 누적각 → 음량 직접 매핑 (±10° = 0~100%) ----
-    // pitchAccum 양수 = 고개 듦(위) → 볼륨 업.
-    // 방향이 반대면 상단의 PITCH_DIR 만 -1 로 바꾸면 됨.
-    var p = S.pitchAccum;
-    var norm = p / VOL_RANGE;                 // -1(아래 끝) ~ +1(위 끝)
-    var targetVol = 0.5 + norm * 0.5;         // -1→0% , 0→50% , +1→100%
-    if(targetVol < 0) targetVol = 0;
-    if(targetVol > 1) targetVol = 1;
-    S.volume = S.volume * 0.7 + targetVol * 0.3;   // 부드럽게 수렴
+    // ===== 볼륨 — relPitch 를 음량으로 매핑 =====
+    // relPitch 를 ±VOL_RANGE 로 클램프 후, 중심볼륨 기준 선형 보간.
+    //   rp = +VOL_RANGE → 100%
+    //   rp =  0         → centerVol (활성화 시점 볼륨)
+    //   rp = −VOL_RANGE → 0%
+    var rp = S.relPitch;
+    if(rp >  VOL_RANGE) rp =  VOL_RANGE;
+    if(rp < -VOL_RANGE) rp = -VOL_RANGE;
+    var t = rp / VOL_RANGE;          // −1 ~ +1
+    var vol;
+    if(t >= 0) vol = S.centerVol + t * (1 - S.centerVol);  // 중심 → 100%
+    else       vol = S.centerVol + t * (S.centerVol);      // 중심 → 0% (t 음수)
+    if(vol < 0) vol = 0;
+    if(vol > 1) vol = 1;
+    S.volume = vol;
     applyVolume();
-    if(Math.abs(pRate) > PITCH_GATE){
-      if(p > 0) flashBadge('VOL ▲ ' + Math.round(S.volume*100), 'var(--vol)');
-      else      flashBadge('VOL ▼ ' + Math.round(S.volume*100), 'var(--hot)');
-    }
 
-    // ---- 곡 넘김: YAW 누적각이 ±20° 도달 시 ----
-    // 방향이 반대면 상단의 YAW_DIR 만 뒤집으면 됨.
-    var turn = S.yawAccum;
+    // ===== 곡 넘김 — relYaw 가 임계 도달 시 =====
     var now = performance.now();
-    if(now - S.lastTrackChange > 3000){
-      if(turn >= YAW_TRIGGER){
+    // 재무장: 중심 부근으로 돌아오면 다음 발동 허용
+    if(Math.abs(S.relYaw) < 8) S.turnArmed = true;
+
+    if(S.turnArmed && now - S.lastTrackChange > TURN_COOLDOWN){
+      if(S.relYaw >= YAW_TRIGGER){
+        S.turnArmed = false;
         S.lastTrackChange = now;
-        S.yawAccum = 0;
         flashBud();
-        nextTrack();                      // 오른쪽 회전 → 다음 곡
-      } else if(turn <= -YAW_TRIGGER){
+        nextTrack();                       // 오른쪽 20° → 다음 곡
+      } else if(S.relYaw <= -YAW_TRIGGER){
+        S.turnArmed = false;
         S.lastTrackChange = now;
-        S.yawAccum = 0;
         flashBud();
-        prevTrack();                      // 왼쪽 회전 → 이전 곡
+        prevTrack();                       // 왼쪽 20° → 이전 곡
       }
     }
+
+    // ===== 화면 반영 =====
+    var showPitch = Math.max(-VOL_RANGE, Math.min(VOL_RANGE, S.relPitch));
+    var showYaw   = Math.max(-YAW_TRIGGER, Math.min(YAW_TRIGGER, S.relYaw));
+    $('head').style.transform =
+      'rotateX(' + (showPitch * 2.4) + 'deg) rotateY(' + (showYaw * 2.2) + 'deg)';
+    $('vPitch').textContent = Math.round(S.relPitch) + '°';
+    $('vYaw').textContent   = Math.round(S.relYaw) + '°';
+    $('vPitch').classList.add('hot');
+    $('vYaw').classList.add('hot');
   }
 
   /* ============================================================
@@ -921,12 +945,15 @@
   /* ============================================================
      데스크톱 폴백 — 키보드로 머리 움직임 테스트
      ↑↓ = 고개 상하(볼륨), ←→ = 고개 좌우(곡 넘김), Space = 모드 토글
+     실제 센서가 없을 때 rawYaw/rawPitch(절대각)를 흉내낸다.
   ============================================================ */
   document.addEventListener('keydown', function(e){
-    if(e.key === 'ArrowUp'){ S.pitchAccum += 4; }    // 고개 듦 → 볼륨↑
-    if(e.key === 'ArrowDown'){ S.pitchAccum -= 4; }  // 고개 숙임 → 볼륨↓
-    if(e.key === 'ArrowLeft'){ S.yawAccum -= 16; }   // 왼쪽 회전 누적
-    if(e.key === 'ArrowRight'){ S.yawAccum += 16; }  // 오른쪽 회전 누적
+    if(S.rawYaw   === null) S.rawYaw   = 0;
+    if(S.rawPitch === null) S.rawPitch = 0;
+    if(e.key === 'ArrowUp'){    S.rawPitch += 3; S.sensorOk = true; }  // 고개 듦
+    if(e.key === 'ArrowDown'){  S.rawPitch -= 3; S.sensorOk = true; }  // 고개 숙임
+    if(e.key === 'ArrowLeft'){  S.rawYaw   -= 5; S.sensorOk = true; }  // 왼쪽 회전
+    if(e.key === 'ArrowRight'){ S.rawYaw   += 5; S.sensorOk = true; }  // 오른쪽 회전
     if(e.key === ' '){ e.preventDefault();
       if(S.armed && S.armSource==='hold') disarmGestures(); else armGestures('hold'); }
   });
@@ -947,8 +974,10 @@
       if(!dragging) return;
       var dx = x - lastX, dy = y - lastY;
       lastX = x; lastY = y;
-      S.pitchAccum -= dy * 0.4;     // 위로 끌면(dy 음수) 고개 듦 → 볼륨↑
-      S.yawAccum   += dx * 0.8;     // 좌우로 끌면 회전 누적
+      if(S.rawYaw   === null) S.rawYaw   = 0;
+      if(S.rawPitch === null) S.rawPitch = 0;
+      S.rawPitch -= dy * 0.25;     // 위로 끌면(dy 음수) 고개 듦 → 볼륨↑
+      S.rawYaw   += dx * 0.4;      // 좌우로 끌면 회전
       S.sensorOk = true;           // 폴백도 동작으로 간주
     }
     function end(){ dragging = false; }
@@ -1065,18 +1094,19 @@
   setInterval(function(){
     var ec = S.eventCount || 0;
     setDbg('dbgEvents', String(ec), ec > 0 ? 'ok' : 'bad');
-    setDbg('dbgBeta',
-      (typeof S.lastBeta === 'number') ? S.lastBeta.toFixed(0) + '°' : '—',
-      (typeof S.lastBeta === 'number') ? 'ok' : '');
-    // 볼륨각(PITCH 누적) / 회전각(YAW 누적)
+    // 원시 절대각 — pitch / yaw
+    var rp = (typeof S.rawPitch === 'number') ? S.rawPitch.toFixed(0) : '—';
+    var ry = (typeof S.rawYaw   === 'number') ? S.rawYaw.toFixed(0)   : '—';
+    setDbg('dbgBeta', rp + '° / ' + ry + '°',
+      (typeof S.rawYaw === 'number') ? 'ok' : 'bad');
+    // 상대각(중심 대비) — 볼륨각 / 회전각. 실제 판정에 쓰는 값.
     setDbg('dbgAxis',
-      Math.round(S.pitchAccum || 0) + '° / ' + Math.round(S.yawAccum || 0) + '°',
+      Math.round(S.relPitch || 0) + '° / ' + Math.round(S.relYaw || 0) + '°',
       S.armed ? 'ok' : '');
-    // 자이로 회전속도 — 상하/좌우 (deg/s)
-    var pr = (typeof S.lastPitchRate === 'number') ? S.lastPitchRate.toFixed(0) : '—';
-    var yr = (typeof S.lastYawRate   === 'number') ? S.lastYawRate.toFixed(0)   : '—';
-    setDbg('dbgGyro', pr + ' / ' + yr,
-      (typeof S.lastYawRate === 'number') ? 'ok' : 'bad');
+    // 곡 넘김 무장 상태
+    setDbg('dbgGyro',
+      S.armed ? (S.turnArmed ? '발동대기' : '복귀필요') : '—',
+      S.armed ? (S.turnArmed ? 'ok' : 'bad') : '');
     if(TRACKS && TRACKS.length){
       var ok = 0, err = 0;
       for(var i=0;i<TRACKS.length;i++){
