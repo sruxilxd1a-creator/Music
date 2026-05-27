@@ -691,6 +691,10 @@
   // 자이로 축 매핑 — 실기 테스트로 확정. 'alpha'|'beta'|'gamma'
   var AXIS_PITCH = 'alpha';   // 고개 상하에 대응하는 rotationRate 성분
   var AXIS_YAW   = 'gamma';   // 고개 좌우에 대응하는 rotationRate 성분
+  // 방향 부호 — 기기에서 반대로 동작하면 +1 / -1 만 뒤집으면 됨.
+  // 이 부호를 회전속도 단계에서 적용하므로 화면 표시와 발동이 항상 일치.
+  var PITCH_DIR  = +1;        // 고개 들 때 볼륨 ↑ 가 되도록
+  var YAW_DIR    = -1;        // 오른쪽 회전 → 다음 곡 이 되도록 (좌우 반전 적용)
 
   S.pitchRate = 0;      // 상하 회전속도 (deg/s)
   S.yawRate   = 0;      // 좌우 회전속도 (deg/s)
@@ -717,8 +721,8 @@
     var g = (typeof rr.gamma === 'number') ? rr.gamma : 0;
     var pick = { alpha: a, beta: b, gamma: g };
 
-    S.pitchRate = pick[AXIS_PITCH] || 0;
-    S.yawRate   = pick[AXIS_YAW]   || 0;
+    S.pitchRate = (pick[AXIS_PITCH] || 0) * PITCH_DIR;
+    S.yawRate   = (pick[AXIS_YAW]   || 0) * YAW_DIR;
     // 진단 패널용
     S.lastPitchRate = S.pitchRate;
     S.lastYawRate   = S.yawRate;
@@ -784,9 +788,8 @@
 
     // ---- 볼륨: PITCH 누적각 → 음량 직접 매핑 (±10° = 0~100%) ----
     // pitchAccum 양수 = 고개 듦(위) → 볼륨 업.
-    // 기기에서 상하가 반대로 동작하면 PITCH_SIGN 만 -1 로.
-    var PITCH_SIGN = +1;
-    var p = S.pitchAccum * PITCH_SIGN;
+    // 방향이 반대면 상단의 PITCH_DIR 만 -1 로 바꾸면 됨.
+    var p = S.pitchAccum;
     var norm = p / VOL_RANGE;                 // -1(아래 끝) ~ +1(위 끝)
     var targetVol = 0.5 + norm * 0.5;         // -1→0% , 0→50% , +1→100%
     if(targetVol < 0) targetVol = 0;
@@ -799,9 +802,8 @@
     }
 
     // ---- 곡 넘김: YAW 누적각이 ±20° 도달 시 ----
-    // 방향 부호는 기기마다 다를 수 있어 YAW_SIGN 으로 보정.
-    var YAW_SIGN = -1;   // 좌우 반전 적용
-    var turn = S.yawAccum * YAW_SIGN;
+    // 방향이 반대면 상단의 YAW_DIR 만 뒤집으면 됨.
+    var turn = S.yawAccum;
     var now = performance.now();
     if(now - S.lastTrackChange > 3000){
       if(turn >= YAW_TRIGGER){
