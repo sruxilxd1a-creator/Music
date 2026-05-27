@@ -314,13 +314,13 @@
   <p class="lead">
     버즈를 끼고 음악을 재생하세요. <b>제스처 모드를 켠 동안</b> 머리를 움직여 조작합니다.<br>
     모드 진입 방법은 두 가지 — 화면의 <b>HOLD 버튼을 누르고 있기</b>, 또는 <b>버즈를 탭</b>(미디어 신호).<br>
-    <span style="font-size:10px;">플레이리스트 6곡 · 끝 곡 다음은 첫 곡으로 루프</span>
+    <span style="font-size:10px;">폰을 이마에 붙이고(스크린이 얼굴 쪽) 사용하는 자세에 최적화 · 6곡 루프</span>
   </p>
   <div class="how">
     <div class="card"><b>↑ 고개 들기</b>볼륨 업</div>
     <div class="card"><b>↓ 고개 숙이기</b>볼륨 다운</div>
-    <div class="card"><b>← 왼쪽 돌리기</b>이전 곡</div>
-    <div class="card"><b>→ 오른쪽 돌리기</b>다음 곡</div>
+    <div class="card"><b>← 왼쪽으로 돌리기</b>이전 곡</div>
+    <div class="card"><b>→ 오른쪽으로 돌리기</b>다음 곡</div>
   </div>
   <button class="start" id="enterBtn">시작 — 센서 권한 허용</button>
   <p class="fine">방향 센서 · 모션 센서 · 오디오 권한을 요청합니다<br>
@@ -337,8 +337,9 @@
       <div class="dbg-row"><span>보안컨텍스트</span><b id="dbgSecure">—</b></div>
       <div class="dbg-row"><span>센서이벤트</span><b id="dbgEvents">0</b></div>
       <div class="dbg-row"><span>권한</span><b id="dbgPerm">—</b></div>
-      <div class="dbg-row"><span>raw β</span><b id="dbgBeta">—</b></div>
-      <div class="dbg-row"><span>pitch/yaw</span><b id="dbgAxis">—</b></div>
+      <div class="dbg-row"><span>기울기 β</span><b id="dbgBeta">—</b></div>
+      <div class="dbg-row"><span>볼륨각/회전각</span><b id="dbgAxis">—</b></div>
+      <div class="dbg-row"><span>자이로 deg/s</span><b id="dbgGyro">—</b></div>
       <div class="dbg-row"><span>음원로드</span><b id="dbgTracks">—</b></div>
     </div>
     <div class="g-badge" id="gBadge">VOL +</div>
@@ -402,9 +403,10 @@
     playing: false,
     trackIdx: 0,
     volume: 0.70,        // 0~1
-    pitchRaw: 0, yawRaw: 0,   // 센서 원시값(가로 모드 축 보정 후)
-    pitch: 0, yaw: 0,         // 평활화된 각도
-    pitchRef: null, yawRef: null,  // 모드 진입 시 기준점(상대 측정)
+    pitchRaw: 0,              // beta 원시값(볼륨용 기울기)
+    pitch: 0,                 // 평활화된 기울기
+    pitchRef: null,           // 모드 진입 시 기울기 기준점
+    yawRate: 0, yawAccum: 0,  // 자이로 회전속도 / 누적 회전각(곡 넘김용)
     lastTrackChange: 0,
     sensorOk: false
   };
@@ -629,9 +631,9 @@
     if(S.armed) return;
     S.armed = true;
     S.armSource = source;
-    // 진입 순간의 자세를 기준점으로 — 평활화된 현재값을 캡처해 상대 측정
+    // 진입 순간의 자세를 볼륨 기준점으로 캡처(상대 측정)
     S.pitchRef = S.pitch;
-    S.yawRef   = S.yaw;
+    S.yawAccum = 0;                          // 자이로 누적 회전각 리셋
     S.lastTrackChange = performance.now();   // 진입 직후 곡 넘김 오발동 방지
     $('led').classList.add('on');
     $('modeTxt').textContent = '제스처 ON · ' + (source === 'buds' ? '버즈' : 'HOLD');
@@ -671,119 +673,124 @@
   }
 
   /* ============================================================
-     센서 입력
-     - pitch: 고개 상하 (deviceorientation beta)
-     - yaw  : 고개 좌우 (webkitCompassHeading 또는 alpha)
+     센서 입력 — 이마 부착(head-mount) 자세 전용 설계
+     ───────────────────────────────────────────────────────────
+     사용 자세: 폰을 이마에 붙임 / 카메라가 왼쪽 / 스크린이 사용자 쪽.
+     폰이 거의 수직으로 선 채 가로로 회전된 상태.
+
+     · 고개 들기/내리기 (볼륨)
+         → 폰이 앞뒤로 끄덕임 = beta 기울기 변화. 안정적이라 그대로 사용.
+     · 고개 좌우 돌리기 (곡 넘김)
+         → 수직축 중심의 "회전"(yaw). 기울기 센서엔 거의 안 잡힌다.
+           devicemotion 의 자이로(rotationRate)로 회전 '속도'를 직접 측정.
+           이마 부착처럼 폰이 머리와 한 몸으로 도는 상황에 가장 정확.
   ============================================================ */
   S.pitchRaw = 0;
+  S.yawRate = 0;        // 자이로 회전속도 (deg/s)
+  S.yawAccum = 0;       // 회전속도 적분값 — 누적 회전각
 
-  /* ----------------------------------------------------------
-     센서 입력 — 가로(landscape) 모드 기준
-     폰을 가로로 들었을 때:
-       · 고개 상하(끄덕임) → beta 축 변화
-       · 고개 좌우(회전)   → gamma 축 변화
-     나침반(alpha/compass)은 자기장 간섭이 심해 사용하지 않고,
-     gamma 기울기를 좌우 회전 신호로 직접 쓴다.
-  ---------------------------------------------------------- */
+  // ---- deviceorientation : 기울기(볼륨용) ----
   function onOrientation(e){
     S.sensorOk = true;
     S.eventCount = (S.eventCount || 0) + 1;
     S.lastBeta = e.beta;
     S.lastGamma = e.gamma;
 
-    // 화면 방향(가로/세로)에 따라 축 보정
-    var ori = (screen.orientation && screen.orientation.angle);
-    if(typeof ori !== 'number') ori = window.orientation || 0;
+    var beta = (typeof e.beta === 'number') ? e.beta : 0;
+    // 이마 부착·수직 자세에서 고개 끄덕임은 beta 가 직접 추적.
+    // beta 는 폰이 수직일 때 ~90, 앞으로 숙이면 감소, 뒤로 젖히면 증가.
+    S.pitchRaw = beta;
+  }
 
-    var beta  = (typeof e.beta  === 'number') ? e.beta  : 0;
-    var gamma = (typeof e.gamma === 'number') ? e.gamma : 0;
+  // ---- devicemotion : 자이로 회전속도(곡 넘김용) ----
+  function onMotion(e){
+    S.sensorOk = true;
+    var rr = e.rotationRate;
+    if(!rr) return;
 
-    // 가로 모드: 회전 각도에 따라 상하/좌우 축이 뒤바뀜
-    var pitch, yaw;
-    if(ori === 90){
-      // 가로(왼쪽으로 눕힘): 상하=gamma, 좌우=beta
-      pitch = gamma;
-      yaw   = beta;
-    } else if(ori === -90 || ori === 270){
-      // 가로(오른쪽으로 눕힘): 부호 반대
-      pitch = -gamma;
-      yaw   = -beta;
-    } else {
-      // 세로(폴백): 상하=beta, 좌우=gamma
-      pitch = beta;
-      yaw   = gamma;
-    }
+    // 이마 부착·가로 자세에서 "고개 좌우 돌리기"는
+    // 폰의 화면 평면에 수직인 축 회전 = rotationRate.gamma 에 가장 크게 나타남.
+    // (기기/방향에 따라 alpha 일 수도 있어 둘 중 큰 쪽을 채택)
+    var rg = (typeof rr.gamma === 'number') ? rr.gamma : 0;
+    var ra = (typeof rr.alpha === 'number') ? rr.alpha : 0;
+    var rate = (Math.abs(rg) >= Math.abs(ra)) ? rg : ra;
 
-    // 평활화된 원시값 — gestureLoop 에서 기준점 대비 상대 측정
-    S.pitchRaw = pitch;
-    S.yawRaw   = yaw;
+    S.yawRate = rate;
+    S.lastYawRate = rate;
   }
 
   /* ============================================================
      제스처 처리 루프 (80ms)
   ============================================================ */
-  var VOL_RATE   = 0.022;   // 프레임당 볼륨 변화량
-  var PITCH_DEAD = 7;       // 상하 데드존(도)
-  var YAW_TURN   = 32;      // 곡 넘김 임계각(도)
-  var AXIS_BIAS  = 1.3;     // 우세 축 판정 — 한 축이 다른 축의 1.3배 이상일 때만 인정
-  var SMOOTH     = 0.35;    // 센서 평활화 계수(0~1, 클수록 민감)
+  var VOL_RATE   = 0.024;   // 프레임당 볼륨 변화량
+  var PITCH_DEAD = 9;       // 상하 데드존(도) — 이보다 작게 기울면 무시
+  var SMOOTH     = 0.30;    // beta 평활화 계수(0~1, 클수록 민감)
+
+  // 곡 넘김 — 자이로 회전 누적각 기준
+  var YAW_GATE   = 0.55;    // 회전속도 게이트(deg/s) — 이보다 느리면 적분 안 함(드리프트 차단)
+  var YAW_TRIGGER= 45;      // 누적 회전각 임계(도) — 이만큼 돌리면 곡 넘김 발동
+  var YAW_DECAY  = 0.90;    // 누적각 자연 감쇠 — 천천히 0으로 복귀(미세동작 리셋)
 
   function gestureLoop(){
-    // ---- 원시 센서값 평활화 (떨림 제거) ----
+    // ---- 볼륨용: beta 기울기 평활화 ----
     S.pitch = S.pitch * (1 - SMOOTH) + (S.pitchRaw || 0) * SMOOTH;
-    S.yaw   = S.yaw   * (1 - SMOOTH) + (S.yawRaw   || 0) * SMOOTH;
 
-    // ---- 기준점 대비 상대 각도 ----
-    var pitchRel = 0, yawRel = 0;
+    // ---- 곡넘김용: 자이로 회전속도 적분 ----
+    // 게이트보다 빠른 회전만 누적 → 손떨림·드리프트 무시.
+    var rate = S.yawRate || 0;
+    if(Math.abs(rate) > YAW_GATE){
+      S.yawAccum += rate * 0.08;          // 0.08초(80ms) 분량 적분
+    } else {
+      S.yawAccum *= YAW_DECAY;            // 가만히 있으면 천천히 0으로
+    }
+
+    // ---- 기준점 대비 상대 각도 (볼륨) ----
+    var pitchRel = 0;
     if(S.armed && S.pitchRef !== null) pitchRel = S.pitch - S.pitchRef;
-    if(S.armed && S.yawRef   !== null) yawRel   = S.yaw   - S.yawRef;
 
     // ---- 3D 머리 반영 ----
     var showPitch = S.armed ? pitchRel : 0;
-    var showYaw   = S.armed ? yawRel   : 0;
+    var showYaw   = S.armed ? Math.max(-60, Math.min(60, S.yawAccum)) : 0;
     $('head').style.transform =
       'rotateX(' + (-showPitch * 0.9) + 'deg) rotateY(' + (showYaw * 0.9) + 'deg)';
     $('vPitch').textContent = Math.round(showPitch) + '°';
-    $('vYaw').textContent   = Math.round(showYaw) + '°';
+    $('vYaw').textContent   = Math.round(S.armed ? S.yawAccum : 0) + '°';
     $('vPitch').classList.toggle('hot', S.armed);
     $('vYaw').classList.toggle('hot', S.armed);
 
-    if(!S.armed) return;
+    if(!S.armed){ S.yawAccum = 0; return; }
 
-    // ---- 우세 축 판정 ----
-    // 두 축이 동시에 움직여도, 더 크게 움직인 축 하나만 인정.
-    // 이렇게 해야 "고개 들기"가 곡 넘김으로 오인되는 충돌을 막는다.
-    var absP = Math.abs(pitchRel), absY = Math.abs(yawRel);
-    var axis = 'none';
-    if(absP > absY * AXIS_BIAS && absP > PITCH_DEAD) axis = 'pitch';
-    else if(absY > absP * AXIS_BIAS && absY > YAW_TURN) axis = 'yaw';
-
-    // ---- 볼륨: 고개 상하 (pitch 축) ----
-    if(axis === 'pitch'){
-      // pitchRel 음수 = 고개 듦(위) → 볼륨 업 / 양수 = 숙임(아래) → 다운
-      // 기기에서 반대로 동작하면 아래 VOL_SIGN 만 -1 로.
-      var VOL_SIGN = +1;
+    // ---- 볼륨: 고개 들기/내리기 (beta 기울기) ----
+    // beta 가 줄면 = 고개 듦(위로) → 볼륨 업
+    // beta 가 늘면 = 고개 숙임(아래) → 볼륨 다운
+    // 기기에서 반대로 동작하면 VOL_SIGN 만 -1 로 바꾸면 됨.
+    var VOL_SIGN = +1;
+    var absP = Math.abs(pitchRel);
+    if(absP > PITCH_DEAD){
       var dir = (pitchRel < 0 ? +1 : -1) * VOL_SIGN;
-      var strength = Math.min(1, (absP - PITCH_DEAD) / 32);
+      var strength = Math.min(1, (absP - PITCH_DEAD) / 30);
       nudgeVolume(dir * VOL_RATE * (0.35 + strength));
       if(dir > 0) flashBadge('VOL ▲ ' + Math.round(S.volume*100), 'var(--vol)');
       else        flashBadge('VOL ▼ ' + Math.round(S.volume*100), 'var(--hot)');
     }
 
-    // ---- 곡 넘김: 고개 좌우 (yaw 축) ----
-    // 곡 전환은 안내 멘트 + 지연이 있으므로 쿨다운을 넉넉히.
+    // ---- 곡 넘김: 고개 좌우 회전 (자이로 누적각) ----
+    // 누적 회전각이 임계를 넘으면 곡 넘김. 방향 부호는 기기마다 다를 수 있어
+    // YAW_SIGN 으로 보정. (오른쪽 회전 → 다음 곡 이 되도록)
+    var YAW_SIGN = +1;
+    var turn = S.yawAccum * YAW_SIGN;
     var now = performance.now();
-    if(axis === 'yaw' && now - S.lastTrackChange > 3000){
-      S.lastTrackChange = now;
-      if(yawRel > YAW_TURN){
+    if(now - S.lastTrackChange > 3000){
+      if(turn > YAW_TRIGGER){
+        S.lastTrackChange = now;
+        S.yawAccum = 0;                   // 누적값 리셋 → 연속 오발동 방지
         flashBud();
-        nextTrack();
-        // 기준점을 현재 자세로 리셋 → 머리를 원위치 안 해도 연속 오발동 방지
-        S.yawRef = S.yaw;
-      } else if(yawRel < -YAW_TURN){
+        nextTrack();                      // 오른쪽 회전 → 다음 곡
+      } else if(turn < -YAW_TRIGGER){
+        S.lastTrackChange = now;
+        S.yawAccum = 0;
         flashBud();
-        prevTrack();
-        S.yawRef = S.yaw;
+        prevTrack();                      // 왼쪽 회전 → 이전 곡
       }
     }
   }
@@ -891,10 +898,10 @@
      ↑↓ = 고개 상하(볼륨), ←→ = 고개 좌우(곡 넘김), Space = 모드 토글
   ============================================================ */
   document.addEventListener('keydown', function(e){
-    if(e.key === 'ArrowUp'){ S.pitchRaw -= 5; }
-    if(e.key === 'ArrowDown'){ S.pitchRaw += 5; }
-    if(e.key === 'ArrowLeft'){ S.yawRaw -= 6; }
-    if(e.key === 'ArrowRight'){ S.yawRaw += 6; }
+    if(e.key === 'ArrowUp'){ S.pitchRaw -= 5; }      // 고개 듦
+    if(e.key === 'ArrowDown'){ S.pitchRaw += 5; }    // 고개 숙임
+    if(e.key === 'ArrowLeft'){ S.yawAccum -= 16; }   // 왼쪽 회전 누적
+    if(e.key === 'ArrowRight'){ S.yawAccum += 16; }  // 오른쪽 회전 누적
     if(e.key === ' '){ e.preventDefault();
       if(S.armed && S.armSource==='hold') disarmGestures(); else armGestures('hold'); }
   });
@@ -916,7 +923,7 @@
       var dx = x - lastX, dy = y - lastY;
       lastX = x; lastY = y;
       S.pitchRaw += dy * 0.5;        // 위로 끌면 고개 듦
-      S.yawRaw   += dx * 0.6;        // 좌우로 끌면 고개 회전
+      S.yawAccum += dx * 0.8;        // 좌우로 끌면 회전 누적
       S.sensorOk = true;            // 폴백도 동작으로 간주
     }
     function end(){ dragging = false; }
@@ -961,7 +968,7 @@
     }
 
     if(typeof DeviceOrientationEvent.requestPermission === 'function'){
-      // iOS 13+ — 명시적 권한 요청
+      // iOS 13+ — 명시적 권한 요청 (방향 + 모션 둘 다)
       setDbg('dbgPerm', '요청중…');
       DeviceOrientationEvent.requestPermission()
         .then(function(s){
@@ -977,11 +984,25 @@
           setDbg('dbgPerm', 'error', 'bad');
           log('⚠ 권한 요청 오류: ' + (err && err.message));
         });
+      // 자이로(devicemotion) 권한 — 곡 넘김에 필수
+      if(typeof DeviceMotionEvent !== 'undefined' &&
+         typeof DeviceMotionEvent.requestPermission === 'function'){
+        DeviceMotionEvent.requestPermission()
+          .then(function(s){
+            if(s === 'granted'){
+              window.addEventListener('devicemotion', onMotion);
+              log('자이로(모션) 센서 권한 허용');
+            } else {
+              log('⚠ 자이로 권한 거부 — 곡 넘김이 동작하지 않을 수 있음');
+            }
+          }).catch(function(){});
+      }
     } else {
       // 안드로이드 Chrome 등 — 권한 단계 없이 바로 리스닝
       window.addEventListener('deviceorientation', onOrientation);
+      window.addEventListener('devicemotion', onMotion);
       setDbg('dbgPerm', 'no-prompt', 'ok');
-      log('센서 리스너 등록(권한 프롬프트 없음)');
+      log('센서 리스너 등록(방향 + 자이로, 권한 프롬프트 없음)');
     }
 
     // 센서 미동작 감지 — 2초 안에 이벤트가 안 오면 경고
@@ -1022,9 +1043,14 @@
     setDbg('dbgBeta',
       (typeof S.lastBeta === 'number') ? S.lastBeta.toFixed(0) + '°' : '—',
       (typeof S.lastBeta === 'number') ? 'ok' : '');
+    // 볼륨각(기준점 대비 기울기) / 회전각(자이로 누적)
+    var pRel = (S.armed && S.pitchRef !== null) ? Math.round(S.pitch - S.pitchRef) : 0;
     setDbg('dbgAxis',
-      Math.round(S.pitch) + ' / ' + Math.round(S.yaw),
+      pRel + '° / ' + Math.round(S.yawAccum || 0) + '°',
       S.armed ? 'ok' : '');
+    setDbg('dbgGyro',
+      (typeof S.lastYawRate === 'number') ? S.lastYawRate.toFixed(0) : '—',
+      (typeof S.lastYawRate === 'number') ? 'ok' : 'bad');
     if(TRACKS && TRACKS.length){
       var ok = 0, err = 0;
       for(var i=0;i<TRACKS.length;i++){
