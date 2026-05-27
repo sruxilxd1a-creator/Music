@@ -706,7 +706,7 @@
   // 고개를 한쪽으로 "휙" 돌리면 그쪽으로 큰 회전속도가 잠깐 발생 →
   // 그 부호로 좌/우를 구분. 누적·기준점·경계점프 전혀 없음.
   var SPIN_AXIS   = 'alpha';  // 좌우 회전이 나타나는 rotationRate 성분
-  var SPIN_DIR    = +1;       // 오른쪽으로 돌릴 때 +가 되도록
+  var SPIN_DIR    = -1;       // 좌우 반전 적용 (오른쪽 휙 → 다음 곡)
   var SPIN_THRESH = 90;       // 곡 넘김 발동 회전속도(deg/s) — 이보다 빠르게 휙 돌리면
   var SPIN_RELEASE= 25;       // 재무장 기준 — 회전속도가 이 아래로 잦아들면 다음 발동 허용
   var TURN_COOLDOWN = 900;    // 곡 넘김 후 최소 대기(ms)
