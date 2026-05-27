@@ -317,10 +317,10 @@
     <span style="font-size:10px;">폰을 이마에 붙이고(스크린이 얼굴 쪽) 사용하는 자세에 최적화 · 6곡 루프</span>
   </p>
   <div class="how">
-    <div class="card"><b>↑ 고개 들기</b>볼륨 업</div>
+    <div class="card"><b>↑ 고개 들기</b>볼륨 업 (정면 기준 ±10°)</div>
     <div class="card"><b>↓ 고개 숙이기</b>볼륨 다운</div>
-    <div class="card"><b>← 왼쪽으로 돌리기</b>이전 곡</div>
-    <div class="card"><b>→ 오른쪽으로 돌리기</b>다음 곡</div>
+    <div class="card"><b>← 왼쪽 20° 돌리기</b>이전 곡</div>
+    <div class="card"><b>→ 오른쪽 20° 돌리기</b>다음 곡</div>
   </div>
   <button class="start" id="enterBtn">시작 — 센서 권한 허용</button>
   <p class="fine">방향 센서 · 모션 센서 · 오디오 권한을 요청합니다<br>
@@ -631,7 +631,7 @@
     if(S.armed) return;
     S.armed = true;
     S.armSource = source;
-    // 진입 순간의 자세를 볼륨 기준점으로 캡처(상대 측정)
+    // 진입 순간의 고개 자세를 볼륨 정면(0°) 기준점으로 캡처
     S.pitchRef = S.pitch;
     S.yawAccum = 0;                          // 자이로 누적 회전각 리셋
     S.lastTrackChange = performance.now();   // 진입 직후 곡 넘김 오발동 방지
@@ -722,14 +722,19 @@
   /* ============================================================
      제스처 처리 루프 (80ms)
   ============================================================ */
-  var VOL_RATE   = 0.024;   // 프레임당 볼륨 변화량
-  var PITCH_DEAD = 9;       // 상하 데드존(도) — 이보다 작게 기울면 무시
   var SMOOTH     = 0.30;    // beta 평활화 계수(0~1, 클수록 민감)
 
-  // 곡 넘김 — 자이로 회전 누적각 기준
-  var YAW_GATE   = 0.55;    // 회전속도 게이트(deg/s) — 이보다 느리면 적분 안 함(드리프트 차단)
-  var YAW_TRIGGER= 45;      // 누적 회전각 임계(도) — 이만큼 돌리면 곡 넘김 발동
-  var YAW_DECAY  = 0.90;    // 누적각 자연 감쇠 — 천천히 0으로 복귀(미세동작 리셋)
+  // ── 볼륨: 고개 상하 ──
+  // 정면(모드 진입 자세) 기준 위 10° ~ 아래 10°, 총 20° 범위에서 동작.
+  // 이 20° 구간에 볼륨 0~100% 를 그대로 매핑 (위 끝=100%, 정면=50%, 아래 끝=0%).
+  var VOL_RANGE  = 10;      // 정면 기준 한쪽 최대 각도(도) — ±10°
+
+  // ── 곡 넘김: 고개 좌우 회전(자이로 누적각) ──
+  // 정면 기준 좌 20° ~ 우 20°, 총 40° 범위. 한쪽 20° 도달 시 곡 넘김 발동.
+  var YAW_TRIGGER = 20;     // 누적 회전각 임계(도) — 한쪽으로 이만큼 돌리면 발동
+  var YAW_CLAMP   = 20;     // 누적각 한계(±20°) — 이 범위를 넘겨 쌓이지 않게 클램프
+  var YAW_GATE    = 0.55;   // 회전속도 게이트(deg/s) — 이보다 느리면 적분 안 함(드리프트 차단)
+  var YAW_DECAY   = 0.90;   // 누적각 자연 감쇠 — 천천히 0으로 복귀(미세동작 리셋)
 
   function gestureLoop(){
     // ---- 볼륨용: beta 기울기 평활화 ----
@@ -743,6 +748,9 @@
     } else {
       S.yawAccum *= YAW_DECAY;            // 가만히 있으면 천천히 0으로
     }
+    // ±YAW_CLAMP(20°) 범위로 제한 — 총 40° 동작 범위를 넘겨 쌓이지 않게.
+    if(S.yawAccum >  YAW_CLAMP) S.yawAccum =  YAW_CLAMP;
+    if(S.yawAccum < -YAW_CLAMP) S.yawAccum = -YAW_CLAMP;
 
     // ---- 기준점 대비 상대 각도 (볼륨) ----
     var pitchRel = 0;
@@ -750,9 +758,9 @@
 
     // ---- 3D 머리 반영 ----
     var showPitch = S.armed ? pitchRel : 0;
-    var showYaw   = S.armed ? Math.max(-60, Math.min(60, S.yawAccum)) : 0;
+    var showYaw   = S.armed ? Math.max(-YAW_TRIGGER, Math.min(YAW_TRIGGER, S.yawAccum)) : 0;
     $('head').style.transform =
-      'rotateX(' + (-showPitch * 0.9) + 'deg) rotateY(' + (showYaw * 0.9) + 'deg)';
+      'rotateX(' + (-showPitch * 1.6) + 'deg) rotateY(' + (showYaw * 2.2) + 'deg)';
     $('vPitch').textContent = Math.round(showPitch) + '°';
     $('vYaw').textContent   = Math.round(S.armed ? S.yawAccum : 0) + '°';
     $('vPitch').classList.toggle('hot', S.armed);
@@ -760,33 +768,43 @@
 
     if(!S.armed){ S.yawAccum = 0; return; }
 
-    // ---- 볼륨: 고개 들기/내리기 (beta 기울기) ----
-    // beta 가 줄면 = 고개 듦(위로) → 볼륨 업
-    // beta 가 늘면 = 고개 숙임(아래) → 볼륨 다운
-    // 기기에서 반대로 동작하면 VOL_SIGN 만 -1 로 바꾸면 됨.
+    // ---- 볼륨: 고개 들기/내리기 (정면 기준 ±10°) ----
+    // 진입 자세(pitchRef)를 0°(정면)로 잡고, ±VOL_RANGE(10°) 범위에
+    // 볼륨 0~100% 를 그대로 매핑한다 (총 20° 구간 = 전체 음량 범위).
+    //   고개 최대로 듦(-10°)  → 볼륨 100%
+    //   정면(0°)             → 볼륨 50%
+    //   고개 최대로 숙임(+10°) → 볼륨 0%
+    // 기기에서 상하가 반대로 동작하면 VOL_SIGN 만 -1 로.
     var VOL_SIGN = +1;
-    var absP = Math.abs(pitchRel);
-    if(absP > PITCH_DEAD){
-      var dir = (pitchRel < 0 ? +1 : -1) * VOL_SIGN;
-      var strength = Math.min(1, (absP - PITCH_DEAD) / 30);
-      nudgeVolume(dir * VOL_RATE * (0.35 + strength));
-      if(dir > 0) flashBadge('VOL ▲ ' + Math.round(S.volume*100), 'var(--vol)');
-      else        flashBadge('VOL ▼ ' + Math.round(S.volume*100), 'var(--hot)');
+    var p = pitchRel * VOL_SIGN;
+    if(p >  VOL_RANGE) p =  VOL_RANGE;
+    if(p < -VOL_RANGE) p = -VOL_RANGE;
+    var norm = p / VOL_RANGE;                 // -1(아래 끝) ~ +1(위 끝)
+    // norm -1 → 0% , norm 0 → 50% , norm +1 → 100%
+    var targetVol = 0.5 + (-norm) * 0.5;      // 위로 들수록(-) 볼륨↑
+    if(targetVol < 0) targetVol = 0;
+    if(targetVol > 1) targetVol = 1;
+    // 부드럽게 수렴 — 떨림 억제
+    S.volume = S.volume * 0.7 + targetVol * 0.3;
+    applyVolume();
+    if(Math.abs(pitchRel) > 1.5){
+      if(norm < 0) flashBadge('VOL ▲ ' + Math.round(S.volume*100), 'var(--vol)');
+      else         flashBadge('VOL ▼ ' + Math.round(S.volume*100), 'var(--hot)');
     }
 
-    // ---- 곡 넘김: 고개 좌우 회전 (자이로 누적각) ----
-    // 누적 회전각이 임계를 넘으면 곡 넘김. 방향 부호는 기기마다 다를 수 있어
-    // YAW_SIGN 으로 보정. (오른쪽 회전 → 다음 곡 이 되도록)
+    // ---- 곡 넘김: 고개 좌우 회전 (정면 기준 ±20°) ----
+    // 누적 회전각이 한쪽으로 YAW_TRIGGER(20°)에 도달하면 곡 넘김.
+    // 방향 부호는 기기마다 다를 수 있어 YAW_SIGN 으로 보정.
     var YAW_SIGN = +1;
     var turn = S.yawAccum * YAW_SIGN;
     var now = performance.now();
     if(now - S.lastTrackChange > 3000){
-      if(turn > YAW_TRIGGER){
+      if(turn >= YAW_TRIGGER){
         S.lastTrackChange = now;
         S.yawAccum = 0;                   // 누적값 리셋 → 연속 오발동 방지
         flashBud();
         nextTrack();                      // 오른쪽 회전 → 다음 곡
-      } else if(turn < -YAW_TRIGGER){
+      } else if(turn <= -YAW_TRIGGER){
         S.lastTrackChange = now;
         S.yawAccum = 0;
         flashBud();
