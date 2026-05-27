@@ -337,8 +337,8 @@
       <div class="dbg-row"><span>보안컨텍스트</span><b id="dbgSecure">—</b></div>
       <div class="dbg-row"><span>센서이벤트</span><b id="dbgEvents">0</b></div>
       <div class="dbg-row"><span>권한</span><b id="dbgPerm">—</b></div>
-      <div class="dbg-row"><span>볼륨각/회전속도</span><b id="dbgBeta">—</b></div>
-      <div class="dbg-row"><span>볼륨 판정각</span><b id="dbgAxis">—</b></div>
+      <div class="dbg-row"><span>회전속도 상하/좌우</span><b id="dbgBeta">—</b></div>
+      <div class="dbg-row"><span>기울기/볼륨</span><b id="dbgAxis">—</b></div>
       <div class="dbg-row"><span>곡넘김 상태</span><b id="dbgGyro">—</b></div>
       <div class="dbg-row"><span>음원로드</span><b id="dbgTracks">—</b></div>
     </div>
@@ -628,29 +628,27 @@
     S.armed = true;
     S.armSource = source;
 
-    // ── 활성화 순간을 볼륨 '중심'으로 캡처 ──
-    // 볼륨(PITCH)만 절대각 중심이 필요. 곡 넘김(YAW)은 스와이프 방식이라
-    // 중심 캡처가 필요 없다(회전속도 순간값으로 판정).
-    S.centerPitch = (S.rawPitch !== null) ? S.rawPitch : null;
-    S.centerVol   = S.volume;                // 볼륨 중심 = 현재 볼륨
-    S.relPitch = 0;
-    S.spinArmed = true;                      // 곡 넘김 스와이프 무장
+    // ── 활성화 초기화 ──
+    // 속도형 볼륨: 볼륨은 현재값에서 이어서 증감하므로 중심 캡처 불필요.
+    // 기울기각만 0으로 리셋(지금 자세가 중심).
+    S.tiltAngle   = 0;                       // 기울기각 리셋(= 중심 0°)
+    S.spinArmed   = true;                    // 곡 넘김 스와이프 무장
     S.lastTrackChange = performance.now();   // 진입 직후 오발동 방지
+    S.lastMotionT = 0;                       // 적분 타임스탬프 리셋
 
     $('led').classList.add('on');
     $('modeTxt').textContent = '제스처 ON · ' + (source === 'buds' ? '버즈' : 'HOLD');
     $('face').classList.add('armed');
     $('head').classList.add('armed');
     $('volBar').classList.add('armed');
-    log('GESTURE <b>ON</b> (' + source + ') — 볼륨 중심 캡처');
+    log('GESTURE <b>ON</b> (' + source + ') — 현재 자세를 중심으로');
   }
   function disarmGestures(){
     if(!S.armed) return;
     S.armed = false;
     var src = S.armSource;
     S.armSource = null;
-    S.centerPitch = null;                    // 다음 활성화 때 새로 캡처
-    S.relPitch = 0;
+    S.tiltAngle = 0;
     $('led').classList.remove('on');
     $('modeTxt').textContent = '제스처 OFF';
     $('face').classList.remove('armed');
@@ -695,16 +693,21 @@
        · 고개 위아래 들기(PITCH) → beta 가 변함
        기기·브라우저 편차가 있어 AXIS_* / DIR 상수로 보정.
   ============================================================ */
-  // ── 볼륨(고개 상하) — deviceorientation 절대각 방식 ──
-  // 어떤 orientation 성분을 쓸지 — 'beta' | 'gamma' | 'alpha'
-  var AXIS_PITCH  = 'gamma';  // 고개 끄덕임이 나타나는 축
-  var PITCH_DIR   = +1;       // 위로 들 때 상대각이 +가 되도록
-  var VOL_RANGE   = 10;       // 볼륨: 중심에서 위/아래 각각 10° (총 20°)
+  // ── 볼륨(고개 상하) — '속도형' : 기울인 동안 계속 차오름 ──
+  // 자이로 회전속도(tiltRate)를 적분해 기울기각(tiltAngle)을 추정하고,
+  // 그 각이 데드존을 벗어나 있으면 '그 동안' 볼륨을 매 프레임 증감시킨다.
+  // 고개를 중심으로 되돌리면(데드존 안) 멈춤. 누적 오차가 볼륨에
+  // 직접 쌓이지 않아 드리프트에 강하다.
+  var TILT_AXIS   = 'beta';   // 상하(끄덕임) 회전이 나타나는 rotationRate 성분
+  var TILT_DIR    = +1;       // 위로 들 때 +가 되도록
+  var VOL_DEAD    = 5;        // 데드존(°) — 중심에서 ±이 각도 안이면 볼륨 정지
+  var VOL_FULL    = 12;       // 이 각도 이상 기울이면 최대 속도로 증감
+  var VOL_SPEED   = 0.9;      // 최대 증감 속도 (초당 볼륨 비율, 0~1 기준)
+  var TILT_GATE   = 1.5;      // 회전속도 게이트(deg/s) — 미동은 각 추정에서 무시
+  var TILT_RECENTER = 0.06;   // 기울기각 자동 중심복귀 계수(드리프트 보정)
 
   // ── 곡 넘김(고개 좌우) — devicemotion 자이로 '스와이프' 방식 ──
   // 절대각이 아니라 회전속도의 순간 방향으로 판정.
-  // 고개를 한쪽으로 "휙" 돌리면 그쪽으로 큰 회전속도가 잠깐 발생 →
-  // 그 부호로 좌/우를 구분. 누적·기준점·경계점프 전혀 없음.
   var SPIN_AXIS   = 'alpha';  // 좌우 회전이 나타나는 rotationRate 성분
   var SPIN_DIR    = -1;       // 왼쪽 돌림 → spin 음수 / 오른쪽 → 양수 (관찰값 기준)
   var SPIN_THRESH = 90;       // 곡 넘김 발동 회전속도(deg/s) — 이보다 빠르게 휙 돌리면
@@ -712,42 +715,26 @@
   var TURN_COOLDOWN = 900;    // 곡 넘김 후 최소 대기(ms)
 
   // ── 센서 원시값 ──
-  S.rawPitch = null;          // 현재 절대 pitch 각 (deviceorientation)
-  S.spinRate = 0;             // 현재 좌우 회전속도 (devicemotion, deg/s)
+  S.tiltRate  = 0;            // 현재 상하 회전속도 (devicemotion, deg/s)
+  S.tiltAngle = 0;            // 추정 기울기각 (중심 대비, °)
+  S.spinRate  = 0;            // 현재 좌우 회전속도 (devicemotion, deg/s)
   S.spinArmed = true;         // 곡 넘김 스와이프 무장 상태
-  // ── 활성화 시점 기준값 (볼륨용) ──
-  S.centerPitch = null;       // 활성화 순간 pitch — 볼륨 중심
-  S.centerVol   = 0.5;        // 활성화 순간 볼륨 — 볼륨 중심값
-  // ── 계산된 상대각 ──
-  S.relPitch = 0;
+  S.lastMotionT = 0;          // 직전 devicemotion 타임스탬프(적분 dt 계산용)
 
-  // 각도 차이를 −180~+180 으로 정규화 (경계 넘김 처리)
-  function angleDiff(cur, ref){
-    var d = cur - ref;
-    while(d > 180)  d -= 360;
-    while(d < -180) d += 360;
-    return d;
-  }
-
-  // ---- deviceorientation : 절대 자세각 — 볼륨(고개 상하)용 ----
+  // ---- deviceorientation : 진단 표시용으로만 ----
   function onOrientation(e){
     S.sensorOk = true;
     S.eventCount = (S.eventCount || 0) + 1;
-
-    var v = { alpha: e.alpha, beta: e.beta, gamma: e.gamma };
-    var rawP = v[AXIS_PITCH];
-    if(typeof rawP === 'number') S.rawPitch = rawP * PITCH_DIR;
-
-    // 진단 패널용
     S.lastBeta  = e.beta;
     S.lastGamma = e.gamma;
     S.lastAlpha = e.alpha;
   }
 
-  // ---- devicemotion : 자이로 회전속도 — 곡 넘김(좌우 휙 돌리기)용 ----
-  // 곡 넘김은 절대각(beta/gamma) 대신 회전'속도'의 순간 방향으로 판정한다.
-  // 절대각은 이마 부착·수직 자세에서 경계 점프·짐벌락으로 부호가 꼬이지만,
-  // 회전속도는 "지금 어느 쪽으로 휙 도는가"를 직접 주므로 좌/우가 명확하다.
+  // ---- devicemotion : 자이로 회전속도 — 볼륨(상하)·곡넘김(좌우) ----
+  // 절대각(beta/gamma)은 이마 부착·수직 자세에서 짐벌락으로 부호가
+  // 꼬이지만, 회전속도는 "지금 어느 쪽으로 도는가"를 직접 준다.
+  //   · 좌우(곡넘김) : 회전속도의 순간 방향만 사용
+  //   · 상하(볼륨)   : 회전속도를 시간 적분해 누적 기울기각으로 사용
   function onMotion(e){
     S.sensorOk = true;
     var rr = e.rotationRate;
@@ -756,30 +743,46 @@
     var b = (typeof rr.beta  === 'number') ? rr.beta  : 0;
     var g = (typeof rr.gamma === 'number') ? rr.gamma : 0;
     S.lastRR = { a: a, b: b, g: g };
-
-    // 좌우 고개 돌리기에 해당하는 회전속도 성분.
-    // 이마 부착·가로 자세에서 좌우 회전은 보통 alpha 축.
-    // 기기 편차는 SPIN_AXIS / SPIN_DIR 로 보정.
     var pick = { alpha: a, beta: b, gamma: g };
-    S.spinRate = (pick[SPIN_AXIS] || 0) * SPIN_DIR;   // deg/s, +면 오른쪽
+
+    // ── 좌우(곡 넘김) : 순간 회전속도 ──
+    S.spinRate = (pick[SPIN_AXIS] || 0) * SPIN_DIR;
+
+    // ── 상하(볼륨) : 회전속도를 적분해 기울기각 추정 ──
+    S.tiltRate = (pick[TILT_AXIS] || 0) * TILT_DIR;
+    var t = (typeof e.timeStamp === 'number') ? e.timeStamp : performance.now();
+    var dt = (S.lastMotionT > 0) ? (t - S.lastMotionT) / 1000 : 0.016;
+    S.lastMotionT = t;
+    if(dt > 0.2) dt = 0.2;   // 큰 공백(백그라운드 복귀 등)은 무시
+    if(S.armed){
+      // 게이트보다 빠른 회전만 적분 → 미동 무시
+      if(Math.abs(S.tiltRate) > TILT_GATE){
+        S.tiltAngle += S.tiltRate * dt;
+      }
+      // 자동 중심복귀 — 적분 드리프트를 천천히 0으로 끌어당김.
+      // 속도형이라 약한 복귀로도 충분(고개를 가만히 두면 서서히 데드존 안으로).
+      S.tiltAngle *= (1 - TILT_RECENTER);
+      // 과도하게 쌓이지 않게 제한
+      if(S.tiltAngle >  40) S.tiltAngle =  40;
+      if(S.tiltAngle < -40) S.tiltAngle = -40;
+    }
   }
 
   /* ============================================================
      제스처 처리 루프 (80ms)
      ────────────────────────────────────────────────────────────
-     절대각 기반 — 적분 없음. 매 프레임 상대각을 새로 계산한다.
+     [볼륨] 속도형 — 고개를 데드존 밖으로 기울이고 있는 '동안'
+       매 프레임 볼륨이 증감한다. 기울기각이 클수록 빠르게 변하고,
+       중심(데드존 안)으로 되돌리면 멈춘다. 파워윈도우 방식.
+         |tiltAngle| ≤ VOL_DEAD        → 볼륨 정지
+         VOL_DEAD < |tiltAngle| < FULL → 기울기 비례 속도로 증감
+         |tiltAngle| ≥ VOL_FULL        → 최대 속도(VOL_SPEED)로 증감
 
-     [볼륨]  중심 = 활성화 시점 자세(centerPitch)·볼륨(centerVol).
-       relPitch =  0°  → 볼륨 = centerVol (그대로)
-       relPitch = +10° → 볼륨 = 100%      (위로 최대)
-       relPitch = −10° → 볼륨 = 0%        (아래로 최대)
-       즉 중심볼륨에서 위·아래로 자연스럽게 증감, 끝에서 100/0 도달.
-
-     [곡 넘김]  자이로 '스와이프' — 고개를 한쪽으로 빠르게 휙 돌리면
-       그 순간 회전속도(spinRate)가 SPIN_THRESH 를 넘는다. 그 부호로
-       좌/우를 판정. 회전속도가 SPIN_RELEASE 아래로 잦아들면 재무장.
-       절대각이 아니라 속도라서 경계 점프·드리프트가 원천적으로 없다.
+     [곡 넘김] 자이로 '스와이프' — 한쪽으로 빠르게 휙 돌리면
+       회전속도(spinRate)가 SPIN_THRESH 를 넘는다. 그 부호로 좌/우 판정.
   ============================================================ */
+  var VOL_DT = 0.08;          // gestureLoop 주기(초)
+
   function gestureLoop(){
     // ===== 비활성 상태 =====
     if(!S.armed){
@@ -791,40 +794,33 @@
       return;
     }
 
-    // ===== 볼륨(PITCH) — 절대각 상대값 =====
-    // 활성화 직후 중심이 비었으면 지금 자세로 캡처
-    if(S.centerPitch === null && S.rawPitch !== null) S.centerPitch = S.rawPitch;
-    S.relPitch = (S.rawPitch !== null && S.centerPitch !== null)
-                 ? angleDiff(S.rawPitch, S.centerPitch) : 0;
-
-    // ===== 볼륨 — relPitch 를 음량으로 매핑 =====
-    // relPitch 를 ±VOL_RANGE 로 클램프 후, 중심볼륨 기준 선형 보간.
-    //   rp = +VOL_RANGE → 100%
-    //   rp =  0         → centerVol (활성화 시점 볼륨)
-    //   rp = −VOL_RANGE → 0%
-    var rp = S.relPitch;
-    if(rp >  VOL_RANGE) rp =  VOL_RANGE;
-    if(rp < -VOL_RANGE) rp = -VOL_RANGE;
-    var t = rp / VOL_RANGE;          // −1 ~ +1
-    var vol;
-    if(t >= 0) vol = S.centerVol + t * (1 - S.centerVol);  // 중심 → 100%
-    else       vol = S.centerVol + t * (S.centerVol);      // 중심 → 0% (t 음수)
-    if(vol < 0) vol = 0;
-    if(vol > 1) vol = 1;
-    S.volume = vol;
-    applyVolume();
+    // ===== 볼륨 — 속도형 : 기울인 동안 계속 증감 =====
+    var tilt = S.tiltAngle;     // onMotion 에서 적분된 기울기각(°)
+    var absT = Math.abs(tilt);
+    if(absT > VOL_DEAD){
+      // 데드존 끝 ~ VOL_FULL 사이를 0~1 세기로 매핑
+      var strength = (absT - VOL_DEAD) / (VOL_FULL - VOL_DEAD);
+      if(strength > 1) strength = 1;
+      // 이번 프레임 볼륨 변화량 = 방향 × 세기 × 최대속도 × 프레임시간
+      var dir = (tilt > 0) ? +1 : -1;       // 위로 기울면 +(볼륨↑)
+      var delta = dir * strength * VOL_SPEED * VOL_DT;
+      S.volume += delta;
+      if(S.volume < 0) S.volume = 0;
+      if(S.volume > 1) S.volume = 1;
+      applyVolume();
+      // 배지 피드백
+      if(dir > 0) flashBadge('VOL ▲ ' + Math.round(S.volume*100), 'var(--vol)');
+      else        flashBadge('VOL ▼ ' + Math.round(S.volume*100), 'var(--hot)');
+    }
+    // 데드존 안이면 볼륨 그대로 — 아무것도 안 함
 
     // ===== 곡 넘김(YAW) — 자이로 스와이프 =====
-    // 회전속도가 SPIN_THRESH 를 넘으면 그 방향으로 곡 넘김.
     var now = performance.now();
     var spin = S.spinRate || 0;
-    // 재무장: 회전이 충분히 잦아들면 다음 발동 허용
-    if(Math.abs(spin) < SPIN_RELEASE) S.spinArmed = true;
+    if(Math.abs(spin) < SPIN_RELEASE) S.spinArmed = true;   // 재무장
 
     if(S.spinArmed && now - S.lastTrackChange > TURN_COOLDOWN){
-      // 이 기기 관찰값: 왼쪽 돌림 = spin 양수 / 오른쪽 돌림 = spin 음수.
-      //   spin 양수(왼쪽 휙)  → 이전 곡
-      //   spin 음수(오른쪽 휙) → 다음 곡
+      // 관찰값: 왼쪽 돌림 = spin 양수 / 오른쪽 = spin 음수
       if(spin >= SPIN_THRESH){
         S.spinArmed = false;
         S.lastTrackChange = now;
@@ -839,13 +835,12 @@
     }
 
     // ===== 화면 반영 =====
-    var showPitch = Math.max(-VOL_RANGE, Math.min(VOL_RANGE, S.relPitch));
-    // 머리 좌우 회전은 회전속도를 부드럽게 반영(시각 피드백용)
+    var showPitch = Math.max(-15, Math.min(15, S.tiltAngle));
     S.yawVisual = (S.yawVisual || 0) * 0.8 + (spin * 0.15) * 0.2;
     var showYaw = Math.max(-30, Math.min(30, S.yawVisual));
     $('head').style.transform =
-      'rotateX(' + (showPitch * 2.4) + 'deg) rotateY(' + (showYaw * 2.2) + 'deg)';
-    $('vPitch').textContent = Math.round(S.relPitch) + '°';
+      'rotateX(' + (showPitch * 2.0) + 'deg) rotateY(' + (showYaw * 2.2) + 'deg)';
+    $('vPitch').textContent = Math.round(S.tiltAngle) + '°';
     $('vYaw').textContent   = Math.round(spin) + '/s';
     $('vPitch').classList.add('hot');
     $('vYaw').classList.add('hot');
@@ -954,20 +949,24 @@
      ↑↓ = 고개 상하(볼륨), ←→ = 곡 넘김 스와이프, Space = 모드 토글
   ============================================================ */
   document.addEventListener('keydown', function(e){
-    if(S.rawPitch === null) S.rawPitch = 0;
-    if(e.key === 'ArrowUp'){    S.rawPitch += 3; S.sensorOk = true; }  // 고개 듦
-    if(e.key === 'ArrowDown'){  S.rawPitch -= 3; S.sensorOk = true; }  // 고개 숙임
+    // 상하 = 볼륨. tiltAngle(기울기각)을 직접 조작 — 기울인 만큼 볼륨이 차오름.
+    if(e.key === 'ArrowUp'){   S.tiltAngle += 3; S.sensorOk = true; }  // 고개 듦
+    if(e.key === 'ArrowDown'){ S.tiltAngle -= 3; S.sensorOk = true; }  // 고개 숙임
+    if(S.tiltAngle >  40) S.tiltAngle =  40;
+    if(S.tiltAngle < -40) S.tiltAngle = -40;
     // 좌우 키 = 스와이프 1회 — spinRate 에 큰 펄스를 잠깐 준다
-    if(e.key === 'ArrowLeft'){  S.spinRate = -(SPIN_THRESH + 30); S.sensorOk = true; }
-    if(e.key === 'ArrowRight'){ S.spinRate =  (SPIN_THRESH + 30); S.sensorOk = true; }
+    if(e.key === 'ArrowLeft'){  S.spinRate =  (SPIN_THRESH + 30); S.sensorOk = true; }
+    if(e.key === 'ArrowRight'){ S.spinRate = -(SPIN_THRESH + 30); S.sensorOk = true; }
     if(e.key === ' '){ e.preventDefault();
       if(S.armed && S.armSource==='hold') disarmGestures(); else armGestures('hold'); }
   });
-  // 폴백 펄스가 한 프레임 뒤 자연히 0으로 — 재무장되도록
+  // 폴백 모드 — 센서 없을 때 spinRate 펄스 감쇠 + tiltAngle 중심복귀
   setInterval(function(){
     if(S.eventCount > 0) return;        // 실제 센서 있으면 폴백 끔
     S.spinRate *= 0.5;
     if(Math.abs(S.spinRate) < 1) S.spinRate = 0;
+    // 폴백에서도 tiltAngle 이 천천히 중심으로 — 실제 onMotion 의 중심복귀 대체
+    S.tiltAngle *= (1 - TILT_RECENTER);
   }, 90);
 
   /* ============================================================
@@ -986,9 +985,11 @@
       if(!dragging) return;
       var dx = x - lastX, dy = y - lastY;
       lastX = x; lastY = y;
-      if(S.rawPitch === null) S.rawPitch = 0;
-      S.rawPitch -= dy * 0.25;        // 위로 끌면(dy 음수) 고개 듦 → 볼륨↑
-      S.spinRate = dx * 6;            // 좌우로 빠르게 끌면 스와이프 발동
+      // 위로 끌면(dy 음수) 고개 듦 → tiltAngle 증가 → 볼륨이 차오름
+      S.tiltAngle -= dy * 0.2;
+      if(S.tiltAngle >  40) S.tiltAngle =  40;
+      if(S.tiltAngle < -40) S.tiltAngle = -40;
+      S.spinRate = -dx * 6;          // 좌우로 빠르게 끌면 스와이프(관찰 부호 반영)
       S.sensorOk = true;
     }
     function end(){ dragging = false; }
@@ -1105,15 +1106,20 @@
   setInterval(function(){
     var ec = S.eventCount || 0;
     setDbg('dbgEvents', String(ec), ec > 0 ? 'ok' : 'bad');
-    // 볼륨 절대각(pitch) / 좌우 회전속도(spin)
-    var rp = (typeof S.rawPitch === 'number') ? S.rawPitch.toFixed(0) : '—';
+    // 상하 회전속도 / 좌우 회전속도
+    var tr = (typeof S.tiltRate === 'number') ? S.tiltRate.toFixed(0) : '—';
     var sp = (typeof S.spinRate === 'number') ? S.spinRate.toFixed(0) : '—';
-    setDbg('dbgBeta', 'P ' + rp + '° / spin ' + sp,
-      (typeof S.rawPitch === 'number') ? 'ok' : 'bad');
-    // 볼륨각(중심 대비 상대각) — 실제 판정값
+    setDbg('dbgBeta', 'tilt ' + tr + ' / spin ' + sp,
+      (typeof S.spinRate === 'number') ? 'ok' : 'bad');
+    // 기울기각 + 데드존 상태 + 현재 볼륨
+    var tilt = S.tiltAngle || 0;
+    var inDead = Math.abs(tilt) <= VOL_DEAD;
+    var volPct = Math.round((S.volume || 0) * 100);
     setDbg('dbgAxis',
-      '볼륨각 ' + Math.round(S.relPitch || 0) + '°',
-      S.armed ? 'ok' : '');
+      Math.round(tilt) + '° ' +
+      (S.armed ? (inDead ? '정지' : (tilt > 0 ? '▲올림' : '▼내림')) : '') +
+      ' · ' + volPct + '%',
+      S.armed ? (inDead ? '' : 'ok') : '');
     // 곡 넘김 스와이프 무장 상태
     setDbg('dbgGyro',
       S.armed ? (S.spinArmed ? '스와이프 대기' : '잦아들기 대기') : '—',
